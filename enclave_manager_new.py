@@ -1,14 +1,26 @@
-from flask import Flask, jsonify, Response, request
-from flask_cors import CORS
-from werkzeug.exceptions import HTTPException
-import subprocess
+import base64
+import hashlib
 import os
 import json
+import platform
+import shutil
+import sys
+import subprocess
 import time
 import logging
 import traceback
+from pathlib import Path
+
+_LOCAL_VENDOR = Path(__file__).resolve().parent / ".vendor"
+if _LOCAL_VENDOR.exists() and str(_LOCAL_VENDOR) not in sys.path:
+    sys.path.insert(0, str(_LOCAL_VENDOR))
+
+from flask import Flask, jsonify, Response, request
+from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 import P3DX_SDK
 from lib.config import config
+from cryptography.fernet import Fernet
 
 
 app = Flask(__name__)
@@ -40,6 +52,483 @@ state = {
 # Flag to track if application is running
 is_app_running = False
 
+# Google Confidential VM placeholder workflow paths.
+CVM_WORKFLOW_DIR = Path(config.base_dir) / "cvm_workflow"
+CVM_ARTIFACTS_DIR = CVM_WORKFLOW_DIR / "artifacts"
+CVM_INCOMING_DIR = CVM_WORKFLOW_DIR / "incoming"
+CVM_RUNTIME_DIR = CVM_WORKFLOW_DIR / "runtime"
+CVM_EVALUATION_SCRIPT = CVM_WORKFLOW_DIR / "evaluation_script.py"
+
+# Placeholder verifier endpoint. In production this should be the remote verifier
+# endpoint that receives the SEV-SNP attestation report from this Google CVM.
+ATTESTATION_VERIFIER_ENDPOINT_PLACEHOLDER = "https://verifier.placeholder.example/attestation/report"
+
+# Real confirmation receiver should POST the confirmation payload here:
+# POST http://<cvm-enclave-manager-host>:4000/enclave/cvm/confirmation
+CONFIRMATION_FILE_PLACEHOLDER = CVM_INCOMING_DIR / "confirmation.json"
+
+
+def cvm_debug(message):
+    """Emit a flush-safe debug line for the Google CVM workflow."""
+    print(f"[Google-CVM workflow] {message}", flush=True)
+
+
+def _ensure_vendor_path():
+    """Prefer local runtime wheels installed under .vendor for ONNX testing."""
+    vendor_path = Path(config.base_dir) / ".vendor"
+    if vendor_path.exists() and str(vendor_path) not in sys.path:
+        sys.path.insert(0, str(vendor_path))
+
+
+def _json_dump(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+
+
+def _json_load(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hardware_evidence():
+    """Collect best-effort hardware evidence for a Google AMD SEV-SNP CVM."""
+    cvm_debug("Collecting hardware evidence from OS-visible CVM interfaces")
+    cpuinfo_path = Path("/proc/cpuinfo")
+    cpuinfo = cpuinfo_path.read_text(errors="ignore") if cpuinfo_path.exists() else ""
+    sev_guest_candidates = [
+        Path("/dev/sev-guest"),
+        Path("/sys/firmware/sev/guest"),
+        Path("/sys/kernel/security/secrets/coco"),
+    ]
+    evidence = {
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "amd_cpu_detected": "AuthenticAMD" in cpuinfo or "AMD" in cpuinfo or "AMD" in platform.processor(),
+        "sev_snp_interface_detected": any(candidate.exists() for candidate in sev_guest_candidates),
+        "sev_snp_interface_candidates": [str(candidate) for candidate in sev_guest_candidates],
+        "google_cloud_hint": Path("/sys/class/dmi/id/product_name").read_text(errors="ignore").strip()
+        if Path("/sys/class/dmi/id/product_name").exists()
+        else None,
+    }
+    cvm_debug(f"Hardware evidence collected: {evidence}")
+    return evidence
+
+
+def _software_evidence():
+    """Collect measurements/config hashes that are safe to share with a verifier."""
+    cvm_debug("Collecting software evidence: manager code hash, config hash, PCR files if present")
+    evidence = {
+        "enclave_manager_code_sha256": P3DX_SDK.hash_enclave_manager_code(config.base_dir),
+        "config_yml_sha256": _sha256_file(Path(config.base_dir) / "config.yml"),
+    }
+
+    pcr_path = Path(config.get_path("pcr_values"))
+    image_hash_path = Path(config.get_path("image_hash"))
+    if pcr_path.exists():
+        evidence["pcr_values"] = _json_load(pcr_path)
+    if image_hash_path.exists():
+        evidence["docker_image_sha256"] = image_hash_path.read_text(encoding="utf-8").strip()
+
+    cvm_debug("Software evidence collected")
+    return evidence
+
+
+def build_attestation_report():
+    """
+    Build a placeholder attestation report.
+
+    Production Google SEV-SNP integration should replace the placeholder section
+    with an SNP_GET_REPORT ioctl through /dev/sev-guest, or the Google-supported
+    attestation report retrieval path for the chosen Confidential VM product.
+    """
+    cvm_debug("Building attestation report with nonce, hardware evidence, and software measurements")
+    nonce = P3DX_SDK.generate_nonce()
+    report = {
+        "format": "google-cvm-amd-sev-snp-placeholder-v1",
+        "nonce": nonce,
+        "created_at_unix": int(time.time()),
+        "hardware": _hardware_evidence(),
+        "software": _software_evidence(),
+        "placeholder_note": (
+            "Replace this object with the raw AMD SEV-SNP report and certificate chain "
+            "before wiring to the production verifier."
+        ),
+    }
+    report_path = CVM_RUNTIME_DIR / "attestation_report.json"
+    _json_dump(report_path, report)
+    cvm_debug(f"Attestation report written to {report_path}")
+    return report
+
+
+def send_attestation_report_to_verifier(report):
+    """
+    Send attestation to verifier, with a local placeholder approval path.
+
+    Set CVM_ATTESTATION_ENDPOINT to use a real verifier. When it is unset, this
+    waits 5 seconds and returns approved=True to keep local development moving.
+    """
+    endpoint = os.getenv("CVM_ATTESTATION_ENDPOINT", ATTESTATION_VERIFIER_ENDPOINT_PLACEHOLDER)
+    cvm_debug(f"Prepared attestation report for verifier endpoint: {endpoint}")
+
+    if endpoint == ATTESTATION_VERIFIER_ENDPOINT_PLACEHOLDER:
+        cvm_debug("Placeholder verifier active; waiting 5 seconds before approving attestation")
+        time.sleep(5)
+        return {
+            "approved": True,
+            "verifier": "placeholder",
+            "message": "Placeholder verifier approved after 5 second wait",
+        }
+
+    import requests
+
+    cvm_debug("Sending attestation report to configured verifier")
+    response = requests.post(endpoint, json=report, timeout=30)
+    response.raise_for_status()
+    verdict = response.json()
+    cvm_debug(f"Verifier response received: {verdict}")
+    return verdict
+
+
+def _resnet34_hyperparameters():
+    return {
+        "architecture": "resnet34",
+        "weights": "random-placeholder",
+        "input_shape": [1, 3, 64, 64],
+        "num_classes": 3,
+        "opset_version": 17,
+        "normalization": "placeholder datasets are already scaled to 0..1",
+        "batch_size": 8,
+    }
+
+
+def _make_placeholder_dataset(dataset_id, sample_count=18):
+    """Fabricate tiny numeric image-like datasets for ONNX Runtime evaluation."""
+    import numpy as np
+
+    rng = np.random.default_rng(7000 + dataset_id)
+    features = rng.normal(0.18, 0.03, size=(sample_count, 3, 64, 64)).astype("float32")
+
+    if dataset_id == 1:
+        labels = np.asarray([idx % 2 for idx in range(sample_count)], dtype="int64")
+        for idx, label in enumerate(labels):
+            features[idx, :, 24:40, 24:40] += 0.55 if label == 1 else 0.05
+        description = "Binary bright-center numerical image dataset"
+        num_classes = 2
+    elif dataset_id == 2:
+        labels = np.asarray([idx % 3 for idx in range(sample_count)], dtype="int64")
+        for idx, label in enumerate(labels):
+            if label == 0:
+                features[idx, 0, 10:18, :] += 0.45
+            elif label == 1:
+                features[idx, 1, :, 28:36] += 0.45
+            else:
+                features[idx, 2, 44:54, :] += 0.45
+        description = "Three-class stripe-position numerical image dataset"
+        num_classes = 3
+    elif dataset_id == 3:
+        labels = np.asarray([(idx // 2) % 2 for idx in range(sample_count)], dtype="int64")
+        for idx, label in enumerate(labels):
+            diagonal = np.eye(64, dtype="float32")
+            if label == 1:
+                features[idx, :, :, :] += diagonal * 0.5
+            else:
+                features[idx, :, :, :] += np.fliplr(diagonal) * 0.5
+        description = "Binary diagonal-pattern numerical image dataset"
+        num_classes = 2
+    else:
+        raise ValueError(f"Unsupported placeholder dataset id: {dataset_id}")
+
+    features = np.clip(features, 0.0, 1.0)
+    return {
+        "dataset_id": dataset_id,
+        "description": description,
+        "num_classes": num_classes,
+        "features": features.tolist(),
+        "labels": labels.tolist(),
+    }
+
+
+def create_placeholder_encrypted_datasets(force=False):
+    encrypted_path = CVM_ARTIFACTS_DIR / "encrypted_dataset.json"
+    keys_path = CVM_ARTIFACTS_DIR / "dataset_keys.json"
+    if encrypted_path.exists() and keys_path.exists() and not force:
+        cvm_debug(f"Encrypted placeholder datasets already exist at {encrypted_path}")
+        return encrypted_path, keys_path
+
+    cvm_debug("Creating encrypted_dataset.json and dataset_keys.json placeholder files")
+    encrypted_payload = {
+        "format": "fernet-placeholder-v1",
+        "note": "Production flow should fetch only the selected dataset key from Secret Manager.",
+        "datasets": {},
+    }
+    key_payload = {
+        "format": "fernet-placeholder-keys-v1",
+        "note": "PLACEHOLDER: replace this file with Google Secret Manager lookups.",
+        "keys": {},
+    }
+
+    for dataset_id in (1, 2, 3):
+        key = Fernet.generate_key()
+        cipher = Fernet(key)
+        dataset = _make_placeholder_dataset(dataset_id)
+        plaintext = json.dumps(dataset).encode("utf-8")
+        encrypted_payload["datasets"][str(dataset_id)] = {
+            "ciphertext": cipher.encrypt(plaintext).decode("utf-8"),
+            "algorithm": "Fernet-AES128-CBC-HMACSHA256",
+        }
+        key_payload["keys"][str(dataset_id)] = key.decode("utf-8")
+        cvm_debug(f"Encrypted placeholder dataset {dataset_id}")
+
+    _json_dump(encrypted_path, encrypted_payload)
+    _json_dump(keys_path, key_payload)
+    return encrypted_path, keys_path
+
+
+def create_placeholder_resnet34_onnx(force=False):
+    model_path = CVM_ARTIFACTS_DIR / "model.onnx"
+    weights_path = CVM_ARTIFACTS_DIR / "model_weights.onnx.data"
+    if model_path.exists() and weights_path.exists() and not force:
+        cvm_debug(f"Placeholder ONNX model already exists at {model_path}")
+        return model_path, weights_path
+
+    cvm_debug("Exporting placeholder ResNet34 with random weights to ONNX")
+    _ensure_vendor_path()
+    import torch
+    from torchvision.models import resnet34
+    import onnx
+
+    CVM_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    temp_model_path = CVM_ARTIFACTS_DIR / "model.inline.onnx"
+    if weights_path.exists():
+        weights_path.unlink()
+
+    model = resnet34(weights=None, num_classes=3)
+    model.eval()
+    dummy_input = torch.randn(1, 3, 64, 64)
+
+    torch.onnx.export(
+        model,
+        dummy_input,
+        str(temp_model_path),
+        input_names=["input"],
+        output_names=["logits"],
+        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+        opset_version=17,
+        dynamo=False,
+    )
+
+    onnx_model = onnx.load(str(temp_model_path))
+    onnx.save_model(
+        onnx_model,
+        str(model_path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=weights_path.name,
+        size_threshold=0,
+    )
+    temp_model_path.unlink(missing_ok=True)
+    cvm_debug(f"ONNX model written to {model_path}")
+    cvm_debug(f"External ONNX weights written to {weights_path}")
+    return model_path, weights_path
+
+
+def create_placeholder_confirmation(force=False, dataset_id=1):
+    confirmation_path = CONFIRMATION_FILE_PLACEHOLDER
+    if confirmation_path.exists() and not force:
+        cvm_debug(f"Placeholder confirmation already exists at {confirmation_path}")
+        return confirmation_path
+
+    cvm_debug("Creating placeholder confirmation.json from verifier payload")
+    model_path, weights_path = create_placeholder_resnet34_onnx(force=force)
+    create_placeholder_encrypted_datasets(force=force)
+    confirmation = {
+        "model": model_path.name,
+        "weights": weights_path.name,
+        "dataset_id": dataset_id,
+        "hyperparameters": _resnet34_hyperparameters(),
+        "placeholder_note": (
+            "This file stands in for the payload that the remote attestation verifier "
+            "will send after approving the CVM."
+        ),
+    }
+    _json_dump(confirmation_path, confirmation)
+    cvm_debug(f"Placeholder confirmation written to {confirmation_path}")
+    return confirmation_path
+
+
+def wait_for_confirmation_payload(timeout_seconds=30):
+    cvm_debug(f"Waiting up to {timeout_seconds}s for confirmation payload at {CONFIRMATION_FILE_PLACEHOLDER}")
+    start = time.time()
+    while time.time() - start < timeout_seconds:
+        if CONFIRMATION_FILE_PLACEHOLDER.exists():
+            confirmation = _json_load(CONFIRMATION_FILE_PLACEHOLDER)
+            cvm_debug(f"Confirmation payload received: {confirmation}")
+            return confirmation
+        time.sleep(1)
+
+    cvm_debug("Confirmation payload timeout reached")
+    print("Shutting down without actually deallocating this placeholder VM.", flush=True)
+    raise TimeoutError(f"confirmation.json not received within {timeout_seconds} seconds")
+
+
+def decrypt_selected_dataset(dataset_id):
+    cvm_debug(f"Selecting encrypted dataset_id={dataset_id}")
+    encrypted_path = CVM_ARTIFACTS_DIR / "encrypted_dataset.json"
+    keys_path = CVM_ARTIFACTS_DIR / "dataset_keys.json"
+    encrypted_payload = _json_load(encrypted_path)
+    key_payload = _json_load(keys_path)
+
+    dataset_key = str(dataset_id)
+    if dataset_key not in encrypted_payload["datasets"]:
+        raise ValueError(f"dataset_id {dataset_id} not found in encrypted_dataset.json")
+    if dataset_key not in key_payload["keys"]:
+        raise ValueError(f"dataset_id {dataset_id} key not found in dataset_keys.json")
+
+    cvm_debug("PLACEHOLDER Secret Manager lookup: reading symmetric key from dataset_keys.json")
+    cipher = Fernet(key_payload["keys"][dataset_key].encode("utf-8"))
+    plaintext = cipher.decrypt(encrypted_payload["datasets"][dataset_key]["ciphertext"].encode("utf-8"))
+    dataset = json.loads(plaintext.decode("utf-8"))
+
+    selected_dataset_path = CVM_RUNTIME_DIR / f"dataset_{dataset_id}_decrypted.json"
+    _json_dump(selected_dataset_path, dataset)
+    cvm_debug(f"Selected dataset decrypted to {selected_dataset_path}")
+    return selected_dataset_path
+
+
+def run_evaluation_script(confirmation, dataset_path):
+    model_path = CVM_ARTIFACTS_DIR / confirmation["model"]
+    weights_path = CVM_ARTIFACTS_DIR / confirmation["weights"]
+    results_path = CVM_RUNTIME_DIR / "results.json"
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    if not weights_path.exists():
+        raise FileNotFoundError(f"External ONNX weights file not found: {weights_path}")
+
+    cvm_debug(f"Compiling ONNX model by creating ONNX Runtime session in {CVM_EVALUATION_SCRIPT}")
+    cvm_debug(f"Model path: {model_path}")
+    cvm_debug(f"Weights path: {weights_path}")
+    cvm_debug(f"Dataset path: {dataset_path}")
+
+    env = os.environ.copy()
+    vendor_path = str(Path(config.base_dir) / ".vendor")
+    env["PYTHONPATH"] = vendor_path + os.pathsep + env.get("PYTHONPATH", "")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CVM_EVALUATION_SCRIPT),
+            "--model",
+            str(model_path),
+            "--dataset",
+            str(dataset_path),
+            "--results",
+            str(results_path),
+        ],
+        cwd=config.base_dir,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if result.stdout:
+        print(result.stdout, end="", flush=True)
+    if result.stderr:
+        print(result.stderr, end="", flush=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Evaluation script failed with exit code {result.returncode}")
+
+    results = _json_load(results_path)
+    cvm_debug(f"results.json populated: {results}")
+    return results_path, results
+
+
+def run_google_cvm_workflow(generate_placeholders=True, confirmation_timeout=30, force_placeholders=False):
+    """Run the requested Google AMD SEV-SNP CVM placeholder workflow end to end."""
+    global state, is_app_running
+
+    is_app_running = True
+    state = {
+        "step": 1,
+        "maxSteps": 4,
+        "title": "Google CVM Attestation",
+        "description": "Building and sending attestation report",
+    }
+
+    for directory in (CVM_ARTIFACTS_DIR, CVM_INCOMING_DIR, CVM_RUNTIME_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    if force_placeholders and CVM_RUNTIME_DIR.exists():
+        cvm_debug(f"Clearing old runtime files from {CVM_RUNTIME_DIR}")
+        for item in CVM_RUNTIME_DIR.iterdir():
+            if item.is_file():
+                item.unlink()
+            elif item.is_dir():
+                shutil.rmtree(item)
+
+    try:
+        cvm_debug("Step 1/4: Verify hardware/software evidence and send attestation report")
+        report = build_attestation_report()
+        verdict = send_attestation_report_to_verifier(report)
+        if not verdict.get("approved"):
+            raise PermissionError(f"Attestation verifier did not approve this CVM: {verdict}")
+        cvm_debug("Attestation approved; continuing workflow")
+
+        state = {
+            "step": 2,
+            "maxSteps": 4,
+            "title": "Waiting for Confirmation Payload",
+            "description": "Polling placeholder confirmation.json",
+        }
+        cvm_debug("Step 2/4: Receive confirmation payload")
+        if generate_placeholders:
+            create_placeholder_confirmation(force=force_placeholders)
+        confirmation = wait_for_confirmation_payload(timeout_seconds=confirmation_timeout)
+
+        state = {
+            "step": 3,
+            "maxSteps": 4,
+            "title": "Decrypting Selected Dataset",
+            "description": "Using placeholder dataset_keys.json instead of Secret Manager",
+        }
+        cvm_debug("Step 3/4: Pull encrypted dataset and decrypt selected dataset")
+        dataset_path = decrypt_selected_dataset(int(confirmation["dataset_id"]))
+
+        state = {
+            "step": 4,
+            "maxSteps": 4,
+            "title": "Evaluating ONNX Model",
+            "description": "Running ONNX Runtime evaluation script",
+        }
+        cvm_debug("Step 4/4: Compile ONNX model, load external weights, evaluate, and write results")
+        results_path, results = run_evaluation_script(confirmation, dataset_path)
+
+        state = {
+            "step": 4,
+            "maxSteps": 4,
+            "title": "Secure Evaluation Complete",
+            "description": f"Results written to {results_path}",
+        }
+        cvm_debug("Google CVM placeholder workflow complete")
+        return {
+            "status": "success",
+            "attestation": verdict,
+            "confirmation_path": str(CONFIRMATION_FILE_PLACEHOLDER),
+            "results_path": str(results_path),
+            "results": results,
+        }
+    finally:
+        is_app_running = False
 
 
 # Removed after_request handler - flask-cors already handles CORS headers
@@ -360,6 +849,61 @@ def upload_encrypted_bundle():
         return jsonify(response), 500
 
 
+@app.route("/enclave/cvm/run", methods=["POST"])
+def run_cvm_workflow_endpoint():
+    """Run the Google AMD SEV-SNP CVM placeholder attestation/evaluation workflow."""
+    content = request.json if request.json else {}
+    try:
+        result = run_google_cvm_workflow(
+            generate_placeholders=content.get("generate_placeholders", True),
+            confirmation_timeout=int(content.get("confirmation_timeout", 30)),
+            force_placeholders=content.get("force_placeholders", False),
+        )
+        return jsonify(result), 200
+    except TimeoutError as e:
+        return jsonify({
+            "status": "timeout",
+            "message": str(e),
+            "placeholder_action": "Shutting down without actually deallocating this placeholder VM.",
+        }), 408
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/enclave/cvm/confirmation", methods=["POST"])
+def receive_cvm_confirmation():
+    """
+    Receive confirmation payload after remote verifier approval.
+
+    Production verifier should POST confirmation.json here:
+    POST http://<cvm-enclave-manager-host>:4000/enclave/cvm/confirmation
+    """
+    content = request.json
+    if not content:
+        return jsonify({"status": "error", "message": "Missing JSON confirmation payload"}), 400
+
+    required_fields = {"model", "weights", "dataset_id", "hyperparameters"}
+    missing = required_fields - set(content.keys())
+    if missing:
+        return jsonify({"status": "error", "message": f"Missing fields: {sorted(missing)}"}), 400
+
+    _json_dump(CONFIRMATION_FILE_PLACEHOLDER, content)
+    cvm_debug(f"Confirmation payload received over HTTP and saved to {CONFIRMATION_FILE_PLACEHOLDER}")
+    return jsonify({
+        "status": "success",
+        "confirmation_path": str(CONFIRMATION_FILE_PLACEHOLDER),
+    }), 200
+
+
+@app.route("/enclave/cvm/results", methods=["GET"])
+def get_cvm_results():
+    results_path = CVM_RUNTIME_DIR / "results.json"
+    if not results_path.exists():
+        return jsonify({"status": "processing", "message": "results.json is not available yet"}), 404
+    return jsonify(_json_load(results_path)), 200
+
+
 
 # INFERENCE: Returns the inference as a JSON object
 @app.route("/enclave/inference", methods=["GET"])
@@ -544,11 +1088,29 @@ def handle_critical_error(e):
 
 
 if __name__ == "__main__":
+    if "--run-cvm-pipeline" in sys.argv:
+        force = "--force-placeholders" in sys.argv
+        no_generate = "--no-generate-placeholders" in sys.argv
+        timeout = 30
+        for arg in sys.argv:
+            if arg.startswith("--confirmation-timeout="):
+                timeout = int(arg.split("=", 1)[1])
+        outcome = run_google_cvm_workflow(
+            generate_placeholders=not no_generate,
+            confirmation_timeout=timeout,
+            force_placeholders=force,
+        )
+        print(json.dumps(outcome, indent=2), flush=True)
+        sys.exit(0)
+
     print("=" * 60)
     print("Starting Enclave Manager")
     print(f"Port: {config.service.port}")
     print("Endpoints available:")
     print("  - POST /enclave/deploy")
+    print("  - POST /enclave/cvm/run")
+    print("  - POST /enclave/cvm/confirmation")
+    print("  - GET  /enclave/cvm/results")
     print("  - GET  /enclave/jwt")
     print("  - GET  /enclave/state")
     print("  - POST /enclave/setstate")

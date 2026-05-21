@@ -28,3 +28,9 @@ CMakeFiles/
 Makefile
 cmake_install.cmake
 AttestationClient
+
+# Local test/runtime artifacts for the Google CVM placeholder workflow
+/.vendor/
+/cvm_workflow/artifacts/
+/cvm_workflow/incoming/
+/cvm_workflow/runtime/
