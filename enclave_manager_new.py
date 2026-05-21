@@ -342,15 +342,19 @@ def create_placeholder_resnet34_onnx(force=False):
     return model_path, weights_path
 
 
-def create_placeholder_confirmation(force=False, dataset_id=1):
+def create_placeholder_confirmation(force=False, dataset_id=1, ensure_artifacts=True):
     confirmation_path = CONFIRMATION_FILE_PLACEHOLDER
     if confirmation_path.exists() and not force:
         cvm_debug(f"Placeholder confirmation already exists at {confirmation_path}")
         return confirmation_path
 
     cvm_debug("Creating placeholder confirmation.json from verifier payload")
-    model_path, weights_path = create_placeholder_resnet34_onnx(force=force)
-    create_placeholder_encrypted_datasets(force=force)
+    if ensure_artifacts:
+        model_path, weights_path = create_placeholder_resnet34_onnx(force=force)
+        create_placeholder_encrypted_datasets(force=force)
+    else:
+        model_path = CVM_ARTIFACTS_DIR / "model.onnx"
+        weights_path = CVM_ARTIFACTS_DIR / "model_weights.onnx.data"
     confirmation = {
         "model": model_path.name,
         "weights": weights_path.name,
@@ -364,6 +368,27 @@ def create_placeholder_confirmation(force=False, dataset_id=1):
     _json_dump(confirmation_path, confirmation)
     cvm_debug(f"Placeholder confirmation written to {confirmation_path}")
     return confirmation_path
+
+
+def prepare_cvm_placeholder_fixtures(force=False, dataset_id=1):
+    """Generate local placeholder inputs outside the attested runtime pipeline."""
+    cvm_debug("Preparing CVM placeholder fixtures outside the runtime pipeline")
+    model_path, weights_path = create_placeholder_resnet34_onnx(force=force)
+    encrypted_path, keys_path = create_placeholder_encrypted_datasets(force=force)
+    confirmation_path = create_placeholder_confirmation(
+        force=force,
+        dataset_id=dataset_id,
+        ensure_artifacts=False,
+    )
+    return {
+        "status": "success",
+        "model_path": str(model_path),
+        "weights_path": str(weights_path),
+        "encrypted_dataset_path": str(encrypted_path),
+        "dataset_keys_path": str(keys_path),
+        "confirmation_path": str(confirmation_path),
+        "note": "These are local placeholder fixtures. The CVM workflow only consumes them.",
+    }
 
 
 def wait_for_confirmation_payload(timeout_seconds=30):
@@ -453,7 +478,7 @@ def run_evaluation_script(confirmation, dataset_path):
     return results_path, results
 
 
-def run_google_cvm_workflow(generate_placeholders=True, confirmation_timeout=30, force_placeholders=False):
+def run_google_cvm_workflow(confirmation_timeout=30, clear_runtime=False):
     """Run the requested Google AMD SEV-SNP CVM placeholder workflow end to end."""
     global state, is_app_running
 
@@ -468,7 +493,7 @@ def run_google_cvm_workflow(generate_placeholders=True, confirmation_timeout=30,
     for directory in (CVM_ARTIFACTS_DIR, CVM_INCOMING_DIR, CVM_RUNTIME_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
-    if force_placeholders and CVM_RUNTIME_DIR.exists():
+    if clear_runtime and CVM_RUNTIME_DIR.exists():
         cvm_debug(f"Clearing old runtime files from {CVM_RUNTIME_DIR}")
         for item in CVM_RUNTIME_DIR.iterdir():
             if item.is_file():
@@ -491,8 +516,6 @@ def run_google_cvm_workflow(generate_placeholders=True, confirmation_timeout=30,
             "description": "Polling placeholder confirmation.json",
         }
         cvm_debug("Step 2/4: Receive confirmation payload")
-        if generate_placeholders:
-            create_placeholder_confirmation(force=force_placeholders)
         confirmation = wait_for_confirmation_payload(timeout_seconds=confirmation_timeout)
 
         state = {
@@ -855,9 +878,8 @@ def run_cvm_workflow_endpoint():
     content = request.json if request.json else {}
     try:
         result = run_google_cvm_workflow(
-            generate_placeholders=content.get("generate_placeholders", True),
             confirmation_timeout=int(content.get("confirmation_timeout", 30)),
-            force_placeholders=content.get("force_placeholders", False),
+            clear_runtime=content.get("clear_runtime", False),
         )
         return jsonify(result), 200
     except TimeoutError as e:
@@ -866,6 +888,21 @@ def run_cvm_workflow_endpoint():
             "message": str(e),
             "placeholder_action": "Shutting down without actually deallocating this placeholder VM.",
         }), 408
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/enclave/cvm/prepare-fixtures", methods=["POST"])
+def prepare_cvm_fixtures_endpoint():
+    """Generate local placeholder artifacts outside the attested runtime pipeline."""
+    content = request.json if request.json else {}
+    try:
+        result = prepare_cvm_placeholder_fixtures(
+            force=content.get("force", False),
+            dataset_id=int(content.get("dataset_id", 1)),
+        )
+        return jsonify(result), 200
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -1088,17 +1125,25 @@ def handle_critical_error(e):
 
 
 if __name__ == "__main__":
+    if "--prepare-cvm-fixtures" in sys.argv:
+        force = "--force" in sys.argv
+        dataset_id = 1
+        for arg in sys.argv:
+            if arg.startswith("--dataset-id="):
+                dataset_id = int(arg.split("=", 1)[1])
+        outcome = prepare_cvm_placeholder_fixtures(force=force, dataset_id=dataset_id)
+        print(json.dumps(outcome, indent=2), flush=True)
+        sys.exit(0)
+
     if "--run-cvm-pipeline" in sys.argv:
-        force = "--force-placeholders" in sys.argv
-        no_generate = "--no-generate-placeholders" in sys.argv
+        clear_runtime = "--clear-runtime" in sys.argv
         timeout = 30
         for arg in sys.argv:
             if arg.startswith("--confirmation-timeout="):
                 timeout = int(arg.split("=", 1)[1])
         outcome = run_google_cvm_workflow(
-            generate_placeholders=not no_generate,
             confirmation_timeout=timeout,
-            force_placeholders=force,
+            clear_runtime=clear_runtime,
         )
         print(json.dumps(outcome, indent=2), flush=True)
         sys.exit(0)
@@ -1109,6 +1154,7 @@ if __name__ == "__main__":
     print("Endpoints available:")
     print("  - POST /enclave/deploy")
     print("  - POST /enclave/cvm/run")
+    print("  - POST /enclave/cvm/prepare-fixtures")
     print("  - POST /enclave/cvm/confirmation")
     print("  - GET  /enclave/cvm/results")
     print("  - GET  /enclave/jwt")
