@@ -8,12 +8,14 @@ import sys
 import time
 import uuid
 from pathlib import Path
+import job_scheduler
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
 import P3DX_SDK
 import tee_tls
+from lib.buffer_lock import job_file_lock
 from lib.config import config
 
 
@@ -401,6 +403,11 @@ def _artifact_path(job_id, artifact_name):
 
 
 def handle_processing_attestation_request(request_payload):
+    with job_file_lock:
+        return _handle_processing_attestation_request_locked(request_payload)
+
+
+def _handle_processing_attestation_request_locked(request_payload):
     _ensure_dirs()
     report = request_payload.get("attestation_report")
     if not report:
@@ -444,6 +451,8 @@ def handle_processing_attestation_request(request_payload):
 
     job["status"] = "dispatched"
     job["assigned_processing_tee_id"] = request_payload.get("processing_tee_id")
+    job["dispatched_at_unix"] = int(time.time())
+    job["processing_tee_results_url"] = f"{URL_SCHEME}://{PROCESSING_TEE_HOST}:{PROCESSING_TEE_PORT}/enclave/cvm/results"
     job["updated_at_unix"] = int(time.time())
     job["confirmation_payload_path"] = delivery["confirmation_path"]
     job["delivery"] = delivery
@@ -460,6 +469,11 @@ def handle_processing_attestation_request(request_payload):
 
 
 def handle_processing_results(job_id, results_payload):
+    with job_file_lock:
+        return _handle_processing_results_locked(job_id, results_payload)
+
+
+def _handle_processing_results_locked(job_id, results_payload):
     _ensure_dirs()
     job = _load_job(job_id)
     results_path = _job_results_path(job_id)
@@ -622,4 +636,6 @@ if __name__ == "__main__":
         run_kwargs["ssl_context"] = tee_tls.build_server_ssl_context("buffer-server")
     else:
         buffer_debug("Starting buffer TEE HTTP server with TLS disabled")
+
+    job_scheduler.start_scheduler_thread()
     app.run(**run_kwargs)
