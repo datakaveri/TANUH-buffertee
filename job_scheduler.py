@@ -11,24 +11,17 @@ import tee_tls
 from lib.buffer_lock import job_file_lock
 from lib.config import config
 
-# ---------------------------------------------------------------------------
-# Tuning knobs — all configurable via environment variables
-# ---------------------------------------------------------------------------
+
 SCHEDULER_INTERVAL_SECONDS    = int(os.getenv("SCHEDULER_INTERVAL_SECONDS",    "30"))
 DISPATCH_TIMEOUT_SECONDS      = int(os.getenv("DISPATCH_TIMEOUT_SECONDS",      "600"))
 JOB_RETENTION_SECONDS         = int(os.getenv("JOB_RETENTION_SECONDS",         "86400"))
 QUEUE_STALL_THRESHOLD_SECONDS = int(os.getenv("QUEUE_STALL_THRESHOLD_SECONDS", "300"))
 
-# ---------------------------------------------------------------------------
-# Path constants — mirrored from enclave_manager_buffer to avoid circular import
-# ---------------------------------------------------------------------------
+
 _BUFFER_WORKFLOW_DIR = Path(config.base_dir) / "cvm_workflow" / "buffer"
 _BUFFER_JOBS_DIR     = _BUFFER_WORKFLOW_DIR / "jobs"
 _BUFFER_QUEUE_FILE   = _BUFFER_WORKFLOW_DIR / "queue.json"
 
-# ---------------------------------------------------------------------------
-# JSON helpers (intentional duplicates — avoids circular import)
-# ---------------------------------------------------------------------------
 
 def _json_load(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
@@ -40,9 +33,7 @@ def _json_dump(path: Path, data: dict) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
 
-# ---------------------------------------------------------------------------
-# Internal queue/job helpers
-# ---------------------------------------------------------------------------
+
 
 def _job_dir(job_id: str) -> Path:
     return _BUFFER_JOBS_DIR / job_id
@@ -77,9 +68,7 @@ def _requeue_job_id(job_id: str) -> None:
 def _all_job_metadata_paths():
     return sorted(_BUFFER_JOBS_DIR.glob("*/job.json"))
 
-# ---------------------------------------------------------------------------
-# Responsibility 1: Re-queue dispatched jobs that have timed out
-# ---------------------------------------------------------------------------
+# Re-queue dispatched jobs that have timed out
 
 def _handle_dispatch_timeouts() -> None:
     now = time.time()
@@ -112,9 +101,7 @@ def _handle_dispatch_timeouts() -> None:
         _json_dump(metadata_path, job)
         _requeue_job_id(job_id)
 
-# ---------------------------------------------------------------------------
-# Responsibility 2: Poll processing TEE for results on dispatched jobs
-# ---------------------------------------------------------------------------
+# Poll processing TEE for results on dispatched jobs
 
 def _poll_dispatched_for_results() -> None:
     for metadata_path in _all_job_metadata_paths():
@@ -167,9 +154,7 @@ def _poll_dispatched_for_results() -> None:
         _json_dump(metadata_path, job)
         logging.info("[scheduler] Job %s marked complete via poll from %s", job_id, results_url)
 
-# ---------------------------------------------------------------------------
-# Responsibility 3: Delete job directories past the retention window
-# ---------------------------------------------------------------------------
+# Delete job directories past the retention window
 
 def _cleanup_old_jobs() -> None:
     now = time.time()
@@ -198,9 +183,7 @@ def _cleanup_old_jobs() -> None:
         except Exception as exc:
             logging.error("[scheduler] Could not delete %s: %s", job_directory, exc)
 
-# ---------------------------------------------------------------------------
-# Responsibility 4: Warn when jobs sit queued without being claimed
-# ---------------------------------------------------------------------------
+# Warn when jobs sit queued without being claimed
 
 def _check_queue_health() -> None:
     now = time.time()
@@ -222,9 +205,7 @@ def _check_queue_health() -> None:
                 job_id, age, QUEUE_STALL_THRESHOLD_SECONDS,
             )
 
-# ---------------------------------------------------------------------------
 # Main scheduler loop
-# ---------------------------------------------------------------------------
 
 def _scheduler_loop() -> None:
     logging.info(
