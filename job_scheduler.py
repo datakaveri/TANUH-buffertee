@@ -21,6 +21,7 @@ QUEUE_STALL_THRESHOLD_SECONDS = int(os.getenv("QUEUE_STALL_THRESHOLD_SECONDS", "
 _BUFFER_WORKFLOW_DIR = Path(config.base_dir) / "cvm_workflow" / "buffer"
 _BUFFER_JOBS_DIR     = _BUFFER_WORKFLOW_DIR / "jobs"
 _BUFFER_QUEUE_FILE   = _BUFFER_WORKFLOW_DIR / "queue.json"
+_DISPATCH_CALLBACK   = None
 
 
 def _json_load(path: Path) -> dict:
@@ -67,6 +68,11 @@ def _requeue_job_id(job_id: str) -> None:
 
 def _all_job_metadata_paths():
     return sorted(_BUFFER_JOBS_DIR.glob("*/job.json"))
+
+
+def set_dispatch_callback(callback) -> None:
+    global _DISPATCH_CALLBACK
+    _DISPATCH_CALLBACK = callback
 
 # Re-queue dispatched jobs that have timed out
 
@@ -223,6 +229,12 @@ def _scheduler_loop() -> None:
                 _check_queue_health()
         except Exception:
             logging.exception("[scheduler] Unhandled exception in scheduler loop")
+
+        if _DISPATCH_CALLBACK is not None:
+            try:
+                _DISPATCH_CALLBACK()
+            except Exception:
+                logging.exception("[scheduler] Dispatch callback failed")
         time.sleep(SCHEDULER_INTERVAL_SECONDS)
 
 

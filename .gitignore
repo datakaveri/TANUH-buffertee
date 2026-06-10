@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ---------------------------------------------------------------------------
+# Vendored / platform-specific binaries (rebuilt from requirements.txt)
+# ---------------------------------------------------------------------------
+.vendor/
+*.pyd
+
+# ---------------------------------------------------------------------------
+# Secrets & keys
+# ---------------------------------------------------------------------------
+keys/
+*.key
+*.pem
+.env
+.env.*
+
+# ---------------------------------------------------------------------------
+# CVM workflow runtime / generated data (jobs, payloads, datasets, artifacts)
+# Large files here exceed GitHub's 100 MB limit and are produced at runtime.
+# evaluation_script.py is intentionally kept tracked.
+# ---------------------------------------------------------------------------
+cvm_workflow/incoming/
+cvm_workflow/secure_jobs/
+cvm_workflow/artifacts/
+cvm_workflow/runtime/
+cvm_workflow/buffer/
+
+# Generated model / dataset artifacts anywhere in the tree
+*.onnx
+*.onnx.data
+*_decrypted.json
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+*.log
+
+# ---------------------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

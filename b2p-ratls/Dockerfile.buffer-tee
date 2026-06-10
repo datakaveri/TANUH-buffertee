@@ -1,0 +1,14 @@
+FROM golang:1.22-bullseye AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /buffer-tee ./cmd/buffer-tee/
+
+FROM debian:bullseye-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /buffer-tee /buffer-tee
+
+# Allow operator to override these env vars via tee-env-* metadata.
+LABEL "tee.launch_policy.allow_env_override"="GPU_CS_ADDR,RATLS_AUDIENCE,GPU_CS_IMAGE_DIGEST"
+ENTRYPOINT ["/buffer-tee"]

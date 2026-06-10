@@ -1,0 +1,7 @@
+# TLS credentials — generate locally before building (see README.md Step 4)
+enclave/certs/
+
+# Go build artifacts
+enclave/buffer-tee
+
+.

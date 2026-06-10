@@ -30,10 +30,8 @@ site/
 pip-wheel-metadata/
 tmp/
 keys/
-cvm_workflow/buffer/
-cvm_workflow/logs/
-cvm_workflow/runtime/
-cvm_workflow/tls/
+cvm_workflow/
+buffer-tee/
 *.log
 *.swp
 *.swo
