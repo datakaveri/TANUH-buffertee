@@ -20,3 +20,4 @@ python enclave_manager_buffer.py
 # CI/CD test
 # retry
 # test full pipeline
+# trigger
