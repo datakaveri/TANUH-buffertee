@@ -14,11 +14,12 @@ const bufferManagerURL = "http://127.0.0.1:4100"
 type Server struct {
 	builder *bundle.Builder
 	mux     *http.ServeMux
+	auth    AuthConfig
 }
 
 // New creates a Server and registers all routes.
-func New(b *bundle.Builder) *Server {
-	s := &Server{builder: b, mux: http.NewServeMux()}
+func New(b *bundle.Builder, auth AuthConfig) *Server {
+	s := &Server{builder: b, mux: http.NewServeMux(), auth: auth}
 	s.mux.HandleFunc("GET /v1/attest",                    s.HandleAttest)
 	s.mux.HandleFunc("POST /v1/submit",                   s.HandleSubmit)
 	// Binary file upload — large files sent over TLS, hashes committed via HPKE
@@ -33,9 +34,13 @@ func New(b *bundle.Builder) *Server {
 	return s
 }
 
-// Handler returns the HTTP handler with CORS middleware.
+// Handler returns the HTTP handler with CORS and optional auth middleware.
 func (s *Server) Handler() http.Handler {
-	return corsMiddleware(s.mux)
+	base := corsMiddleware(s.mux)
+	if s.auth.JWKSUrl == "" {
+		return base
+	}
+	return keycloakAuthMiddleware(s.auth.JWKSUrl, s.auth.Issuer, base)
 }
 
 // corsMiddleware adds CORS headers and handles OPTIONS preflights.
@@ -43,7 +48,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "X-RATLS-Nonce, X-RATLS-Browser-HPKE, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "X-RATLS-Nonce, X-RATLS-Browser-HPKE, Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

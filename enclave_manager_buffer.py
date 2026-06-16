@@ -577,6 +577,41 @@ def handle_processing_results(job_id, results_payload):
         return _handle_results_locked(job_id, results_payload)
 
 
+def _update_leaderboard_in_gcs(job_id, results_payload):
+    """Download leaderboard.json, append this result, re-upload. Non-fatal on any error."""
+    try:
+        from google.cloud import storage as gcs
+        client  = gcs.Client()
+        bucket  = client.bucket(GCS_RESULTS_BUCKET)
+        lb_blob = bucket.blob("leaderboard.json")
+
+        try:
+            existing = json.loads(lb_blob.download_as_text())
+        except Exception:
+            existing = {"entries": []}
+
+        entries = existing.get("entries", [])
+        entries.append({
+            "job_id":          job_id,
+            "submitted_at":    results_payload.get("submitted_at_unix",  int(time.time())),
+            "completed_at":    int(time.time()),
+            "dataset_id":      results_payload.get("dataset_id"),
+            "accuracy":        results_payload.get("accuracy"),
+            "elapsed_seconds": results_payload.get("elapsed_seconds"),
+            "num_samples":     results_payload.get("num_samples"),
+            "model_sha256":    results_payload.get("model_sha256", ""),
+            "attestation":     results_payload.get("attestation", {}),
+        })
+        leaderboard = {"updated_at": int(time.time()), "entries": entries}
+        lb_blob.upload_from_string(
+            json.dumps(leaderboard, indent=2),
+            content_type="application/json",
+        )
+        buffer_debug(f"Leaderboard updated → gs://{GCS_RESULTS_BUCKET}/leaderboard.json ({len(entries)} entries)")
+    except Exception as exc:
+        buffer_debug(f"Leaderboard update failed (non-fatal): {exc}")
+
+
 def _handle_results_locked(job_id, results_payload):
     _ensure_dirs()
     job          = _load_job(job_id)
@@ -584,6 +619,7 @@ def _handle_results_locked(job_id, results_payload):
     _json_dump(results_path, results_payload)
 
     gcs_uri = _upload_results_to_gcs(job_id, results_payload)
+    _update_leaderboard_in_gcs(job_id, results_payload)
 
     job["status"]           = "complete"
     job["updated_at_unix"]  = int(time.time())

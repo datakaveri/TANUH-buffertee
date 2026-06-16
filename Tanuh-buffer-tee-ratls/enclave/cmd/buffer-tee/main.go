@@ -21,6 +21,17 @@ func main() {
 	certFile  := mustEnv("TLS_CERT")
 	keyFile   := mustEnv("TLS_KEY")
 
+	jwksURL := os.Getenv("KEYCLOAK_JWKS_URL") // optional — empty disables auth
+	issuer  := os.Getenv("KEYCLOAK_ISSUER")
+	if jwksURL != "" && issuer == "" {
+		log.Fatal("KEYCLOAK_ISSUER must be set when KEYCLOAK_JWKS_URL is set")
+	}
+	if jwksURL != "" {
+		log.Printf("buffer-tee: Keycloak auth enabled (issuer=%s)", issuer)
+	} else {
+		log.Println("buffer-tee: Keycloak auth disabled (KEYCLOAK_JWKS_URL not set)")
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -39,7 +50,7 @@ func main() {
 		log.Fatalf("buffer-tee: load TLS cert: %v", err)
 	}
 
-	srv := server.New(builder)
+	srv := server.New(builder, server.AuthConfig{JWKSUrl: jwksURL, Issuer: issuer})
 	httpSrv := &http.Server{
 		Addr:    ":8443",
 		Handler: srv.Handler(),

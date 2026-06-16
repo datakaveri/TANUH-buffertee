@@ -16,7 +16,7 @@ COPY certs/tls.crt /certs/tls.crt
 COPY certs/tls.key /certs/tls.key
 
 # Declare which env vars the CS operator is allowed to override via tee-env-* metadata.
-LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,TLS_CERT,TLS_KEY"
+LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,TLS_CERT,TLS_KEY,KEYCLOAK_JWKS_URL,KEYCLOAK_ISSUER"
 
 EXPOSE 8443
 ENTRYPOINT ["/buffer-tee"]

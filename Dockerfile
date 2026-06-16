@@ -26,7 +26,7 @@ ENV PYTHONUNBUFFERED=1 \
     TEE_USE_TLS=0 \
     BUFFER_RATLS_CLIENT_BIN=/usr/local/bin/buffer-tee \
     GPU_CS_ADDR=10.128.15.210:443 \
-    GPU_CS_IMAGE_DIGEST=sha256:2b60c12c7f713ebdc35083954b86edbd89d7e370873585fa8f283d2b012df1e9 \
+    GPU_CS_IMAGE_DIGEST=sha256:e83d03462234fcc7a4cbf157e0670618151b35f96cbca435f2b356a55bb10119 \
     RATLS_AUDIENCE=ratls-buffer-tee \
     BUFFER_BOOTSTRAP_PLACEHOLDER_QUEUE=0 \
     SCHEDULER_INTERVAL_SECONDS=15 \
@@ -56,7 +56,7 @@ COPY Tanuh-buffer-tee-ratls/enclave/certs /app/certs
 RUN chmod +x /app/entrypoint.sh /usr/local/bin/buffer-tee /usr/local/bin/buffer-server \
     && mkdir -p /app/cvm_workflow/buffer /app/cvm_workflow/tls /app/cvm_workflow/logs
 
-LABEL "tee.launch_policy.allow_env_override"="RATLS_SERVER_AUDIENCE,TLS_CERT,TLS_KEY"
+LABEL "tee.launch_policy.allow_env_override"="RATLS_SERVER_AUDIENCE,TLS_CERT,TLS_KEY,GPU_CS_IMAGE_DIGEST,KEYCLOAK_JWKS_URL,KEYCLOAK_ISSUER"
 
 EXPOSE 4100 8443
 
