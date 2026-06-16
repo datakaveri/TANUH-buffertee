@@ -22,3 +22,4 @@ python enclave_manager_buffer.py
 # test full pipeline
 # trigger
 # env var fix
+# yaml fix
