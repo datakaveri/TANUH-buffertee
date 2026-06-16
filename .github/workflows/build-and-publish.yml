@@ -1,0 +1,67 @@
+name: Build and Publish Buffer TEE
+
+on:
+  push:
+    branches: [main, buffer-tee]
+
+env:
+  REGISTRY: us-central1-docker.pkg.dev
+  IMAGE:    us-central1-docker.pkg.dev/p3dx-depa-sandbox/ratls-enclave/buffer-tee
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for GCP
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ env.IMAGE }}:${{ github.sha }} \
+            -t ${{ env.IMAGE }}:latest \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          docker push ${{ env.IMAGE }}:latest
+
+      - name: Get image digest
+        id: digest
+        run: |
+          DIGEST=$(docker inspect \
+            --format='{{index .RepoDigests 0}}' \
+            ${{ env.IMAGE }}:latest | cut -d@ -f2)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "Buffer TEE digest: $DIGEST"
+
+      - name: Trigger browser-ratls digest update
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.BROWSER_RATLS_PAT }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: 'datakaveri',
+              repo:  'Tanuh-browser-ratls',
+              event_type: 'update-buffer-tee-digest',
+              client_payload: {
+                digest:     '${{ steps.digest.outputs.digest }}',
+                component:  'buffer-tee',
+                commit_sha: '${{ github.sha }}'
+              }
+            })
+            console.log('Triggered browser-ratls digest update')
