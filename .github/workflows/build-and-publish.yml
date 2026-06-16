@@ -2,7 +2,7 @@ name: Build and Publish Buffer TEE
 
 on:
   push:
-    branches: [main, buffer-tee]
+    branches: [main, buffer-tee, ci-cd-image-digest]
 
 env:
   REGISTRY: us-central1-docker.pkg.dev
