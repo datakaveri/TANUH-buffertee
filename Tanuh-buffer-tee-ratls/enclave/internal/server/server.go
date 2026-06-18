@@ -23,8 +23,9 @@ func New(b *bundle.Builder, auth AuthConfig) *Server {
 	s.mux.HandleFunc("GET /v1/attest",                    s.HandleAttest)
 	s.mux.HandleFunc("POST /v1/submit",                   s.HandleSubmit)
 	// Binary file upload — large files sent over TLS, hashes committed via HPKE
-	s.mux.HandleFunc("PUT /v1/upload/{job_id}/model",     s.HandleUploadModel)
-	s.mux.HandleFunc("PUT /v1/upload/{job_id}/weights",   s.HandleUploadWeights)
+	s.mux.HandleFunc("PUT /v1/upload/{job_id}/model",          s.HandleUploadModel)
+	s.mux.HandleFunc("PUT /v1/upload/{job_id}/weights",        s.HandleUploadWeights)
+	s.mux.HandleFunc("PUT /v1/upload/{job_id}/preprocessing",  s.HandleUploadPreprocessing)
 	s.mux.HandleFunc("GET /v1/status/{job_id}",           s.HandleStatus)
 	s.mux.HandleFunc("GET /v1/queue",                     s.HandleQueue)
 	s.mux.HandleFunc("GET /v1/results/{job_id}",          s.HandleResults)

@@ -29,9 +29,10 @@ const (
 // Model bytes are NOT included — they are uploaded separately via /v1/upload.
 // SHA256 hashes commit to the files before they arrive (prevents in-transit swaps).
 type JobRequest struct {
-	DatasetID     int    `json:"dataset_id"`     // 1, 2, or 3
-	ModelSHA256   string `json:"model_sha256"`   // hex SHA256 of model.onnx plaintext
-	WeightsSHA256 string `json:"weights_sha256"` // hex SHA256 of weights plaintext
+	DatasetID           int    `json:"dataset_id"`               // 1, 2, or 3
+	ModelSHA256         string `json:"model_sha256"`             // hex SHA256 of model.onnx plaintext
+	WeightsSHA256       string `json:"weights_sha256"`           // hex SHA256 of weights plaintext
+	PreprocessingSHA256 string `json:"preprocessing_sha256,omitempty"` // hex SHA256 of preprocessing.py (dataset_id=2)
 }
 
 // ChunkedUploadHeader is Frame 0 of the AES-256-GCM-CHUNKED-v1 stream.
@@ -139,6 +140,19 @@ func (s *Server) HandleUploadWeights(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxyPlaintextUpload(w, bufferManagerURL+"/buffer/jobs/"+jobID+"/weights", plaintext)
+}
+
+// HandleUploadPreprocessing serves PUT /v1/upload/{job_id}/preprocessing.
+// Decrypts the user's preprocessing.py and forwards plaintext to Flask.
+func (s *Server) HandleUploadPreprocessing(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job_id")
+	plaintext, err := s.decryptChunkedUpload(r.Body, r.Header.Get("X-RATLS-Browser-HPKE"))
+	if err != nil {
+		log.Printf("preprocessing upload decrypt %s: %v", jobID, err)
+		http.Error(w, "decryption failed: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	proxyPlaintextUpload(w, bufferManagerURL+"/buffer/jobs/"+jobID+"/preprocessing", plaintext)
 }
 
 // decryptChunkedUpload reads and decrypts an AES-256-GCM-CHUNKED-v1 framed stream.
@@ -293,11 +307,15 @@ func processJob(plaintext []byte) []byte {
 		return jsonErr("dataset_id must be 1, 2, or 3")
 	}
 
-	flaskPayload, _ := json.Marshal(map[string]interface{}{
+	flaskData := map[string]interface{}{
 		"dataset_id":     jobReq.DatasetID,
 		"model_sha256":   jobReq.ModelSHA256,
 		"weights_sha256": jobReq.WeightsSHA256,
-	})
+	}
+	if jobReq.PreprocessingSHA256 != "" {
+		flaskData["preprocessing_sha256"] = jobReq.PreprocessingSHA256
+	}
+	flaskPayload, _ := json.Marshal(flaskData)
 
 	resp, err := http.Post(bufferManagerURL+"/buffer/jobs", "application/json", //nolint:noctx
 		bytes.NewReader(flaskPayload))

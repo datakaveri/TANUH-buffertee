@@ -8,9 +8,10 @@ Flow:
   3. buffer-server decrypts inside the SEV-SNP TEE, then POSTs to /buffer/jobs here.
   4. job_scheduler.py dispatches the job to the Processing TEE via RA-TLS
      (buffer-tee Go client → gpu-cs Go server on port 443).
-  5. Processing TEE decrypts dataset, runs ONNX inference, POSTs results back to
-     /buffer/jobs/<job_id>/results.
-  6. Results are stored locally and uploaded to GCS.
+  5. Processing TEE decrypts dataset, runs ONNX inference, uploads results to GCS,
+     then self-deallocates.
+  6. Buffer TEE polls GCS for results on GET /v1/results/{job_id} and returns them
+     to the browser.
 """
 
 import base64
@@ -53,8 +54,9 @@ BUFFER_RUNTIME_DIR          = BUFFER_WORKFLOW_DIR / "runtime"
 BUFFER_SHARED_ARTIFACTS_DIR = BUFFER_WORKFLOW_DIR / "shared_artifacts"
 DISPATCH_STATE_FILE         = BUFFER_RUNTIME_DIR / "dispatch_state.json"
 
-MODEL_FILE_NAME   = "model.onnx"
-WEIGHTS_FILE_NAME = "model.onnx.data"
+MODEL_FILE_NAME          = "model.onnx"
+WEIGHTS_FILE_NAME        = "model.onnx.data"
+PREPROCESSING_FILE_NAME  = "preprocessing.py"
 
 BUFFER_TEE_HOST  = os.getenv("BUFFER_TEE_HOST",  "0.0.0.0")
 BUFFER_TEE_PORT  = int(os.getenv("BUFFER_TEE_PORT", "4100"))
@@ -66,9 +68,14 @@ PROCESSING_VM_START_SCRIPT        = os.getenv("PROCESSING_VM_START_SCRIPT",
                                                str(Path(config.base_dir) / "start-gpu-cs-vm.sh"))
 PROCESSING_VM_START_COMMAND       = os.getenv("PROCESSING_VM_START_COMMAND", "")
 PROCESSING_VM_START_COOLDOWN_SECONDS = int(os.getenv("PROCESSING_VM_START_COOLDOWN_SECONDS", "45"))
-PROCESSING_VM_BOOT_TIMEOUT_SECONDS  = int(os.getenv("PROCESSING_VM_BOOT_TIMEOUT_SECONDS", "120"))
+PROCESSING_VM_BOOT_TIMEOUT_SECONDS  = int(os.getenv("PROCESSING_VM_BOOT_TIMEOUT_SECONDS", "180"))
 PROCESSING_VM_BOOT_POLL_INTERVAL    = int(os.getenv("PROCESSING_VM_BOOT_POLL_INTERVAL_SECONDS", "5"))
 PROCESSING_EXPECTED_IMAGE_DIGEST    = os.getenv("GPU_CS_IMAGE_DIGEST", "")
+# A job marked "dispatched" whose Processing TEE died before uploading results
+# would otherwise block the scheduler forever. If results are still absent from
+# GCS, the VM is unhealthy, and at least this many seconds have passed since
+# dispatch, treat the job as orphaned and requeue it for re-dispatch.
+DISPATCH_ORPHAN_GRACE_SECONDS       = int(os.getenv("DISPATCH_ORPHAN_GRACE_SECONDS", "60"))
 
 BUFFER_RATLS_CLIENT_BIN    = os.getenv("BUFFER_RATLS_CLIENT_BIN", "")
 BUFFER_RATLS_CLIENT_WORKDIR = Path(os.getenv("BUFFER_RATLS_CLIENT_WORKDIR",
@@ -238,8 +245,9 @@ def _create_job_record(content):
         "weights_file":      WEIGHTS_FILE_NAME,
         "artifact_dir":      str(job_dir / "artifacts"),
         "submitted_by":      content.get("submitted_by", "unknown"),
-        "model_sha256_expected":   content.get("model_sha256", ""),
-        "weights_sha256_expected": content.get("weights_sha256", ""),
+        "model_sha256_expected":          content.get("model_sha256", ""),
+        "weights_sha256_expected":        content.get("weights_sha256", ""),
+        "preprocessing_sha256_expected":  content.get("preprocessing_sha256", ""),
         "notes":             content.get("notes", ""),
     }
     _save_job(job)
@@ -247,11 +255,15 @@ def _create_job_record(content):
 
 
 def _receive_artifact(job_id, artifact_name, data: bytes):
-    """Write a binary artifact and queue the job if both files are present and hashes match."""
+    """Write a binary artifact and queue the job when all required files are present."""
     _ensure_dirs()
     job = _load_job(job_id)
     if job["status"] not in ("pending_upload",):
         raise ValueError(f"Job {job_id} is not awaiting upload (status={job['status']})")
+
+    allowed = {MODEL_FILE_NAME, WEIGHTS_FILE_NAME, PREPROCESSING_FILE_NAME}
+    if artifact_name not in allowed:
+        raise ValueError(f"Unknown artifact name: {artifact_name}")
 
     artifacts_dir = Path(job["artifact_dir"])
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -259,9 +271,12 @@ def _receive_artifact(job_id, artifact_name, data: bytes):
     path.write_bytes(data)
 
     sha256_actual = hashlib.sha256(data).hexdigest()
-    sha256_key = "model_sha256_expected" if artifact_name == MODEL_FILE_NAME else "weights_sha256_expected"
-    sha256_expected = job.get(sha256_key, "")
-
+    sha256_key_map = {
+        MODEL_FILE_NAME:         "model_sha256_expected",
+        WEIGHTS_FILE_NAME:       "weights_sha256_expected",
+        PREPROCESSING_FILE_NAME: "preprocessing_sha256_expected",
+    }
+    sha256_expected = job.get(sha256_key_map[artifact_name], "")
     if sha256_expected and sha256_actual != sha256_expected:
         raise ValueError(
             f"SHA256 mismatch for {artifact_name}: "
@@ -270,14 +285,20 @@ def _receive_artifact(job_id, artifact_name, data: bytes):
 
     job["updated_at_unix"] = int(time.time())
 
-    # Check if both files are now present — if so, queue the job
-    model_path   = artifacts_dir / MODEL_FILE_NAME
-    weights_path = artifacts_dir / WEIGHTS_FILE_NAME
-    if model_path.exists() and weights_path.exists():
+    # For dataset_id=2 (Oral Cancer) require model + weights + preprocessing.py.
+    # For all other datasets require only model + weights.
+    model_path        = artifacts_dir / MODEL_FILE_NAME
+    weights_path      = artifacts_dir / WEIGHTS_FILE_NAME
+    preprocessing_path = artifacts_dir / PREPROCESSING_FILE_NAME
+    all_required = model_path.exists() and weights_path.exists()
+    if all_required and int(job.get("dataset_id", 0)) == 2:
+        all_required = preprocessing_path.exists()
+
+    if all_required:
         job["status"] = "queued"
         _save_job(job)
         _queue_job(job)
-        buffer_debug(f"Job {job_id} both files received — queued")
+        buffer_debug(f"Job {job_id} all required files received — queued")
     else:
         _save_job(job)
         buffer_debug(f"Job {job_id} artifact {artifact_name} saved ({len(data)//1024} KB)")
@@ -288,7 +309,7 @@ def _receive_artifact(job_id, artifact_name, data: bytes):
 # ── Artifact serving ──────────────────────────────────────────────────────────
 
 def _artifact_path(job_id, artifact_name):
-    allowed = {MODEL_FILE_NAME, WEIGHTS_FILE_NAME}
+    allowed = {MODEL_FILE_NAME, WEIGHTS_FILE_NAME, PREPROCESSING_FILE_NAME}
     if artifact_name not in allowed:
         raise FileNotFoundError(f"Unknown artifact: {artifact_name}")
     path = _job_dir(job_id) / "artifacts" / artifact_name
@@ -415,7 +436,7 @@ def _buffer_url(path):
 def _build_secure_dispatch_payload(job):
     model_bytes   = _artifact_bytes(job["job_id"], MODEL_FILE_NAME)
     weights_bytes = _artifact_bytes(job["job_id"], WEIGHTS_FILE_NAME)
-    return {
+    payload = {
         "job_id":            job["job_id"],
         "dataset_id":        job["dataset_id"],
         "submitted_at_unix": job["submitted_at_unix"],
@@ -424,11 +445,17 @@ def _build_secure_dispatch_payload(job):
         "weights_file":      WEIGHTS_FILE_NAME,
         "model_sha256":      hashlib.sha256(model_bytes).hexdigest(),
         "weights_sha256":    hashlib.sha256(weights_bytes).hexdigest(),
-        "model_onnx_base64":   base64.b64encode(model_bytes).decode(),
+        "model_onnx_base64":    base64.b64encode(model_bytes).decode(),
         "model_weights_base64": base64.b64encode(weights_bytes).decode(),
-        "buffer_results_callback_url": _buffer_url(f"/buffer/jobs/{job['job_id']}/results"),
         "buffer_job_url":    _buffer_url(f"/buffer/jobs/{job['job_id']}"),
     }
+    # Include preprocessing script for Oral Cancer jobs
+    preprocessing_path = Path(job["artifact_dir"]) / PREPROCESSING_FILE_NAME
+    if preprocessing_path.exists():
+        preprocessing_bytes = preprocessing_path.read_bytes()
+        payload["preprocessing_script_base64"] = base64.b64encode(preprocessing_bytes).decode()
+        payload["preprocessing_sha256"] = hashlib.sha256(preprocessing_bytes).hexdigest()
+    return payload
 
 
 def _write_secure_dispatch_payload(job):
@@ -486,15 +513,83 @@ def _mark_job_dispatched(job_id, payload_path):
 
 # ── Main scheduler dispatch callback ─────────────────────────────────────────
 
+def _requeue_orphaned_dispatched_jobs():
+    """
+    Recover jobs stuck in "dispatched" because the Processing TEE died before
+    uploading results (e.g. mid-eval shutdown). Such a job is removed from the
+    queue and would otherwise block the scheduler forever.
+
+    A dispatched job is considered orphaned when ALL of:
+      - its results are not yet present in GCS, and
+      - the dispatch happened at least DISPATCH_ORPHAN_GRACE_SECONDS ago, and
+      - the Processing TEE is not currently healthy (a live eval keeps it up).
+
+    Orphaned jobs are reset to "queued" and re-added to the queue. Returns the
+    list of requeued job_ids.
+    """
+    requeued = []
+    now = int(time.time())
+    with job_file_lock:
+        dispatched = [
+            _json_load(p) for p in _all_job_metadata_paths()
+            if _json_load(p).get("status") == "dispatched"
+        ]
+    if not dispatched:
+        return requeued
+
+    for job in dispatched:
+        job_id = job.get("job_id")
+        if now - int(job.get("dispatched_at_unix", 0)) < DISPATCH_ORPHAN_GRACE_SECONDS:
+            continue
+        # If results have landed in GCS, the job is actually complete — cache and skip.
+        try:
+            payload = _fetch_results_from_gcs(job_id)
+        except Exception as exc:
+            buffer_debug(f"Orphan check: GCS fetch for {job_id} failed: {exc}")
+            payload = None
+        if payload is not None:
+            _cache_results_locally(job_id, payload)
+            continue
+        # No results yet. If the Processing TEE is still healthy, an eval may be
+        # in flight — leave it alone. Otherwise the VM is gone: requeue.
+        if _processing_vm_is_healthy():
+            continue
+        with job_file_lock:
+            current = _load_job(job_id)
+            if current.get("status") != "dispatched":
+                continue
+            current["status"]         = "queued"
+            current["updated_at_unix"] = now
+            current["requeued_at_unix"] = now
+            current["requeue_count"]   = int(current.get("requeue_count", 0)) + 1
+            _save_job(current)
+            _queue_job(current)
+        requeued.append(job_id)
+        buffer_debug(
+            f"Requeued orphaned job {job_id} — Processing TEE died before "
+            f"results upload (requeue #{current['requeue_count']})"
+        )
+        _update_dispatch_state(
+            last_dispatch_attempt_unix=now,
+            last_dispatch_job_id=job_id,
+            last_dispatch_status="requeued_orphan",
+            last_dispatch_error="processing TEE died before results upload",
+        )
+    return requeued
+
+
 def dispatch_next_queued_job():
     """
     Called by job_scheduler every SCHEDULER_INTERVAL_SECONDS.
 
-    1. Skip if another job is already dispatched.
-    2. Healthcheck the Processing TEE; start it if not running.
-    3. Build the secure payload and dispatch via RA-TLS.
+    1. Recover any jobs orphaned by a dead Processing TEE.
+    2. Skip if another job is already (still legitimately) dispatched.
+    3. Healthcheck the Processing TEE; start it if not running.
+    4. Build the secure payload and dispatch via RA-TLS.
     """
     _ensure_dirs()
+
+    _requeue_orphaned_dispatched_jobs()
 
     with job_file_lock:
         if any(_json_load(p).get("status") == "dispatched"
@@ -550,96 +645,53 @@ def dispatch_next_queued_job():
     buffer_debug(f"Job {job['job_id']} dispatched successfully via RA-TLS")
 
 
-# ── Results handling + GCS upload ─────────────────────────────────────────────
+# ── Results — GCS fetch ────────────────────────────────────────────────────────
 
-def _upload_results_to_gcs(job_id, results_payload):
-    """Upload results.json to GCS. Returns gs:// URI or None on failure."""
-    try:
-        from google.cloud import storage as gcs
-        blob_name = f"results/{job_id}/results.json"
-        client    = gcs.Client()
-        bucket    = client.bucket(GCS_RESULTS_BUCKET)
-        blob      = bucket.blob(blob_name)
-        blob.upload_from_string(
-            json.dumps(results_payload, indent=2),
-            content_type="application/json",
-        )
-        uri = f"gs://{GCS_RESULTS_BUCKET}/{blob_name}"
-        buffer_debug(f"Results uploaded → {uri}")
-        return uri
-    except Exception as exc:
-        buffer_debug(f"GCS upload failed (non-fatal): {exc}")
+def _fetch_results_from_gcs(job_id):
+    """
+    Download results.json for job_id from GCS.
+    Returns the parsed dict on success, None if the object doesn't exist yet,
+    or raises on unexpected errors.
+    """
+    from google.cloud import storage as gcs
+    blob_name = f"results/{job_id}/results.json"
+    client    = gcs.Client()
+    bucket    = client.bucket(GCS_RESULTS_BUCKET)
+    blob      = bucket.blob(blob_name)
+    if not blob.exists():
         return None
+    return json.loads(blob.download_as_text())
 
 
-def handle_processing_results(job_id, results_payload):
-    with job_file_lock:
-        return _handle_results_locked(job_id, results_payload)
-
-
-def _update_leaderboard_in_gcs(job_id, results_payload):
-    """Download leaderboard.json, append this result, re-upload. Non-fatal on any error."""
-    try:
-        from google.cloud import storage as gcs
-        client  = gcs.Client()
-        bucket  = client.bucket(GCS_RESULTS_BUCKET)
-        lb_blob = bucket.blob("leaderboard.json")
-
-        try:
-            existing = json.loads(lb_blob.download_as_text())
-        except Exception:
-            existing = {"entries": []}
-
-        entries = existing.get("entries", [])
-        entries.append({
-            "job_id":          job_id,
-            "submitted_at":    results_payload.get("submitted_at_unix",  int(time.time())),
-            "completed_at":    int(time.time()),
-            "dataset_id":      results_payload.get("dataset_id"),
-            "accuracy":        results_payload.get("accuracy"),
-            "elapsed_seconds": results_payload.get("elapsed_seconds"),
-            "num_samples":     results_payload.get("num_samples"),
-            "model_sha256":    results_payload.get("model_sha256", ""),
-            "attestation":     results_payload.get("attestation", {}),
-        })
-        leaderboard = {"updated_at": int(time.time()), "entries": entries}
-        lb_blob.upload_from_string(
-            json.dumps(leaderboard, indent=2),
-            content_type="application/json",
-        )
-        buffer_debug(f"Leaderboard updated → gs://{GCS_RESULTS_BUCKET}/leaderboard.json ({len(entries)} entries)")
-    except Exception as exc:
-        buffer_debug(f"Leaderboard update failed (non-fatal): {exc}")
-
-
-def _handle_results_locked(job_id, results_payload):
+def _cache_results_locally(job_id, results_payload):
+    """Persist GCS-fetched results (or an error report) to disk and update the
+    job status. The Processing TEE writes an error payload (status="error") to
+    the same GCS location on failure, so a fetched payload may be either."""
     _ensure_dirs()
-    job          = _load_job(job_id)
     results_path = _job_results_path(job_id)
     _json_dump(results_path, results_payload)
 
-    gcs_uri = _upload_results_to_gcs(job_id, results_payload)
-    _update_leaderboard_in_gcs(job_id, results_payload)
+    is_error  = isinstance(results_payload, dict) and results_payload.get("status") == "error"
+    job_status = "error" if is_error else "complete"
 
-    job["status"]           = "complete"
-    job["updated_at_unix"]  = int(time.time())
-    job["results_path"]     = str(results_path)
-    if gcs_uri:
-        job["gcs_results_uri"] = gcs_uri
-    _save_job(job)
-
-    _update_dispatch_state(
-        last_dispatch_attempt_unix=int(time.time()),
-        last_dispatch_job_id=job_id,
-        last_dispatch_status="results_received",
-        last_dispatch_error="",
+    with job_file_lock:
+        job = _load_job(job_id)
+        job["status"]          = job_status
+        job["updated_at_unix"] = int(time.time())
+        job["results_path"]    = str(results_path)
+        job["gcs_results_uri"] = f"gs://{GCS_RESULTS_BUCKET}/results/{job_id}/results.json"
+        if is_error:
+            job["last_error"] = results_payload.get("error", "")
+        _save_job(job)
+        _update_dispatch_state(
+            last_dispatch_attempt_unix=int(time.time()),
+            last_dispatch_job_id=job_id,
+            last_dispatch_status=("job_failed" if is_error else "results_received"),
+            last_dispatch_error=(results_payload.get("error", "") if is_error else ""),
+        )
+    buffer_debug(
+        f"{'Error report' if is_error else 'Results'} cached locally for job {job_id}"
     )
-    return {
-        "status":          "success",
-        "job_id":          job_id,
-        "results_path":    str(results_path),
-        "gcs_results_uri": gcs_uri or "",
-    }
 
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
@@ -694,6 +746,22 @@ def upload_weights(job_id):
         return jsonify({"status": "error", "message": str(exc)}), 400
 
 
+@app.route("/buffer/jobs/<job_id>/preprocessing", methods=["PUT"])
+def upload_preprocessing(job_id):
+    """Receive plaintext preprocessing.py bytes and write to job artifacts."""
+    data = request.get_data()
+    if not data:
+        return jsonify({"status": "error", "message": "empty body"}), 400
+    try:
+        job = _receive_artifact(job_id, PREPROCESSING_FILE_NAME, data)
+        return jsonify({"status": job["status"], "job_id": job_id,
+                        "bytes": len(data)}), 200
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": "Unknown job_id"}), 404
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+
 @app.route("/buffer/jobs", methods=["GET"])
 def list_jobs():
     _ensure_dirs()
@@ -725,28 +793,34 @@ def get_job_artifact(job_id, artifact_name):
 
 @app.route("/buffer/jobs/<job_id>/results", methods=["GET"])
 def get_job_results(job_id):
-    """Return inference results for a completed job."""
+    """Return inference results for a completed job.
+
+    Checks local disk cache first; on miss, polls GCS directly.
+    When GCS has the object the results are cached locally and returned.
+    """
+    job_path = _job_metadata_path(job_id)
+    if not job_path.exists():
+        return jsonify({"status": "error", "message": "Unknown job_id"}), 404
+
+    # Fast path: already cached from a previous fetch
     results_path = _job_results_path(job_id)
-    if not results_path.exists():
-        job_path = _job_metadata_path(job_id)
-        if not job_path.exists():
-            return jsonify({"status": "error", "message": "Unknown job_id"}), 404
+    if results_path.exists():
+        return jsonify(_json_load(results_path)), 200
+
+    # Slow path: ask GCS
+    try:
+        payload = _fetch_results_from_gcs(job_id)
+    except Exception as exc:
+        buffer_debug(f"GCS fetch for {job_id} failed: {exc}")
         job = _json_load(job_path)
         return jsonify({"status": job.get("status", "unknown"), "message": "results not yet available"}), 404
-    return jsonify(_json_load(results_path)), 200
 
+    if payload is None:
+        job = _json_load(job_path)
+        return jsonify({"status": job.get("status", "unknown"), "message": "results not yet available"}), 404
 
-@app.route("/buffer/jobs/<job_id>/results", methods=["POST"])
-def record_processing_results(job_id):
-    """Callback from Processing TEE after inference completes."""
-    content = request.json or {}
-    try:
-        result = handle_processing_results(job_id, content)
-        return jsonify(result), 200
-    except FileNotFoundError:
-        return jsonify({"status": "error", "message": "Unknown job_id"}), 404
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 400
+    _cache_results_locally(job_id, payload)
+    return jsonify(payload), 200
 
 
 @app.route("/buffer/dispatch/state", methods=["GET"])
