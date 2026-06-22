@@ -19,9 +19,33 @@ mkdir -p \
   "$BASE_DIR/cvm_workflow/tls" \
   "$BASE_DIR/cvm_workflow/logs"
 
-if [ -f /app/start-gpu-cs-vm.sh ]; then
-  chmod +x /app/start-gpu-cs-vm.sh
-fi
+for _vm_script in start-gpu-cs-vm.sh stop-gpu-cs-vm.sh start-cpu-cs-vm.sh stop-cpu-cs-vm.sh; do
+  if [ -f "/app/${_vm_script}" ]; then
+    chmod +x "/app/${_vm_script}"
+  fi
+done
+
+# Fetch TLS cert from GCP Secret Manager at startup.
+# Cert is not baked into the image — fetched at runtime so renewals don't require a rebuild.
+_SM_TOKEN=$(curl -sf \
+  -H 'Metadata-Flavor: Google' \
+  'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+_SM_BASE="https://secretmanager.googleapis.com/v1/projects/p3dx-depa-sandbox/secrets"
+
+mkdir -p /run/certs
+curl -sf -H "Authorization: Bearer $_SM_TOKEN" \
+  "$_SM_BASE/tanuh-tls-cert/versions/latest:access" \
+  | python3 -c "import sys,json,base64; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)['payload']['data']))" \
+  > /run/certs/tls.crt
+curl -sf -H "Authorization: Bearer $_SM_TOKEN" \
+  "$_SM_BASE/tanuh-tls-key/versions/latest:access" \
+  | python3 -c "import sys,json,base64; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)['payload']['data']))" \
+  > /run/certs/tls.key
+chmod 600 /run/certs/tls.key
+
+export TLS_CERT=/run/certs/tls.crt
+export TLS_KEY=/run/certs/tls.key
 
 # Start the user-facing RA-TLS HTTPS server on :8443.
 # It uses RATLS_SERVER_AUDIENCE (browser-facing audience) — kept separate from

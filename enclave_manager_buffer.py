@@ -68,9 +68,42 @@ PROCESSING_VM_START_SCRIPT        = os.getenv("PROCESSING_VM_START_SCRIPT",
                                                str(Path(config.base_dir) / "start-gpu-cs-vm.sh"))
 PROCESSING_VM_START_COMMAND       = os.getenv("PROCESSING_VM_START_COMMAND", "")
 PROCESSING_VM_START_COOLDOWN_SECONDS = int(os.getenv("PROCESSING_VM_START_COOLDOWN_SECONDS", "45"))
-PROCESSING_VM_BOOT_TIMEOUT_SECONDS  = int(os.getenv("PROCESSING_VM_BOOT_TIMEOUT_SECONDS", "180"))
+PROCESSING_VM_BOOT_TIMEOUT_SECONDS  = int(os.getenv("PROCESSING_VM_BOOT_TIMEOUT_SECONDS", "300"))
 PROCESSING_VM_BOOT_POLL_INTERVAL    = int(os.getenv("PROCESSING_VM_BOOT_POLL_INTERVAL_SECONDS", "5"))
 PROCESSING_EXPECTED_IMAGE_DIGEST    = os.getenv("GPU_CS_IMAGE_DIGEST", "")
+
+# ── GPU / CPU provisioning targets ─────────────────────────────────────────────
+# The Buffer TEE first tries to provision the GPU Processing TEE. If it fails to
+# become healthy after MAX_GPU_PROVISION_ATTEMPTS stop→start cycles, it falls
+# back to a pre-provisioned CPU Processing TEE VM (separate image, own digest).
+# The fallback is per-job and non-sticky: every new job tries the GPU first.
+
+MAX_GPU_PROVISION_ATTEMPTS        = int(os.getenv("MAX_GPU_PROVISION_ATTEMPTS", "3"))
+
+# GPU VM identity + stop hook (for the clean stop→start retry cycle).
+GPU_CS_INSTANCE                   = os.getenv("GPU_CS_INSTANCE", "gpu-cs-tdx-h100")
+GPU_CS_ZONE                       = os.getenv("GPU_CS_ZONE", "us-central1-a")
+GPU_VM_STOP_SCRIPT                = os.getenv("GPU_VM_STOP_SCRIPT",
+                                               str(Path(config.base_dir) / "stop-gpu-cs-vm.sh"))
+
+# CPU fallback VM. CPU_CS_ADDR must be set for the fallback path to function;
+# if unset, provisioning degrades to GPU-only (capped at MAX_GPU_PROVISION_ATTEMPTS).
+CPU_CS_ADDR                       = os.getenv("CPU_CS_ADDR", "")
+CPU_RATLS_HEALTHCHECK_URL         = os.getenv("CPU_RATLS_HEALTHCHECK_URL",
+                                               f"https://{CPU_CS_ADDR}/healthz" if CPU_CS_ADDR else "")
+CPU_CS_INSTANCE                   = os.getenv("CPU_CS_INSTANCE", "cpu-cs-snp")
+CPU_CS_ZONE                       = os.getenv("CPU_CS_ZONE", "us-central1-a")
+CPU_VM_START_SCRIPT               = os.getenv("CPU_VM_START_SCRIPT",
+                                               str(Path(config.base_dir) / "start-cpu-cs-vm.sh"))
+CPU_VM_STOP_SCRIPT                = os.getenv("CPU_VM_STOP_SCRIPT",
+                                               str(Path(config.base_dir) / "stop-cpu-cs-vm.sh"))
+CPU_VM_BOOT_TIMEOUT_SECONDS       = int(os.getenv("CPU_VM_BOOT_TIMEOUT_SECONDS", "300"))
+# Distinct image digest for the CPU build. Required for CPU dispatch — there is
+# no safe default (the CPU image is a different image than the GPU one).
+CPU_CS_IMAGE_DIGEST               = os.getenv("CPU_CS_IMAGE_DIGEST", "")
+# How long to wait for a VM to reach a stopped/TERMINATED state before restarting
+# it during a retry cycle. Bounded so a stuck stop never hangs the scheduler.
+VM_STOP_WAIT_SECONDS              = int(os.getenv("VM_STOP_WAIT_SECONDS", "60"))
 # A job marked "dispatched" whose Processing TEE died before uploading results
 # would otherwise block the scheduler forever. If results are still absent from
 # GCS, the VM is unhealthy, and at least this many seconds have passed since
@@ -285,13 +318,13 @@ def _receive_artifact(job_id, artifact_name, data: bytes):
 
     job["updated_at_unix"] = int(time.time())
 
-    # For dataset_id=2 (Oral Cancer) require model + weights + preprocessing.py.
-    # For all other datasets require only model + weights.
-    model_path        = artifacts_dir / MODEL_FILE_NAME
-    weights_path      = artifacts_dir / WEIGHTS_FILE_NAME
+    # If the client committed to a preprocessing hash in /v1/submit, wait for
+    # preprocessing.py before queuing — regardless of dataset_id.
+    model_path         = artifacts_dir / MODEL_FILE_NAME
+    weights_path       = artifacts_dir / WEIGHTS_FILE_NAME
     preprocessing_path = artifacts_dir / PREPROCESSING_FILE_NAME
     all_required = model_path.exists() and weights_path.exists()
-    if all_required and int(job.get("dataset_id", 0)) == 2:
+    if all_required and job.get("preprocessing_sha256_expected", ""):
         all_required = preprocessing_path.exists()
 
     if all_required:
@@ -324,15 +357,19 @@ def _artifact_bytes(job_id, artifact_name):
 
 # ── Processing TEE health & start ─────────────────────────────────────────────
 
-def _processing_vm_is_healthy():
+def _vm_is_healthy(healthcheck_url, label="Processing TEE"):
+    """Probe a TEE /healthz endpoint. Records the result in dispatch state."""
+    if not healthcheck_url:
+        buffer_debug(f"{label} healthcheck skipped — no healthcheck URL configured")
+        return False
     try:
-        resp = requests.get(PROCESSING_RATLS_HEALTHCHECK_URL, timeout=5, verify=False)
+        resp = requests.get(healthcheck_url, timeout=5, verify=False)
         ok = resp.status_code == 200
         _update_dispatch_state(
             last_vm_healthcheck_unix=int(time.time()),
             last_vm_healthcheck_ok=ok,
         )
-        buffer_debug(f"Processing TEE healthcheck → {resp.status_code}")
+        buffer_debug(f"{label} healthcheck → {resp.status_code}")
         return ok
     except Exception as exc:
         _update_dispatch_state(
@@ -340,83 +377,243 @@ def _processing_vm_is_healthy():
             last_vm_healthcheck_ok=False,
             last_dispatch_error=f"healthcheck failed: {exc}",
         )
-        buffer_debug(f"Processing TEE healthcheck failed: {exc}")
+        buffer_debug(f"{label} healthcheck failed: {exc}")
         return False
 
 
-def _vm_start_command():
-    if PROCESSING_VM_START_COMMAND.strip():
-        return PROCESSING_VM_START_COMMAND.strip(), "command"
-    candidate = Path(PROCESSING_VM_START_SCRIPT)
+def _processing_vm_is_healthy():
+    """Backward-compatible GPU healthcheck wrapper."""
+    return _vm_is_healthy(PROCESSING_RATLS_HEALTHCHECK_URL, "Processing TEE (GPU)")
+
+
+def _resolve_start_command(start_script, start_command=""):
+    """Resolve a (target, mode) pair for a VM start/stop action. A non-empty
+    command takes precedence over the script path."""
+    if start_command and start_command.strip():
+        return start_command.strip(), "command"
+    candidate = Path(start_script)
     if candidate.exists():
         return str(candidate), "script"
     return "", ""
 
 
-def _request_processing_vm_start():
-    now = int(time.time())
-    state = _dispatch_state()
-    if now - int(state.get("last_vm_start_request_unix", 0)) < PROCESSING_VM_START_COOLDOWN_SECONDS:
-        buffer_debug("VM start skipped — within cooldown window")
-        return False
-
-    start_target, start_mode = _vm_start_command()
-    if not start_target:
-        buffer_debug("No Processing TEE start command configured")
-        _update_dispatch_state(
-            last_vm_start_request_unix=now,
-            last_vm_start_mode="missing",
-            last_dispatch_error="No processing VM start command configured",
-        )
-        return False
-
-    buffer_debug(f"Starting Processing TEE via {start_mode}: {start_target}")
+def _run_vm_subprocess(target, mode, action_label):
+    """Run a VM start/stop script or command. Returns True on exit 0."""
     try:
         completed = subprocess.run(
-            [start_target] if start_mode == "script" else start_target,
+            [target] if mode == "script" else target,
             cwd=config.base_dir,
             capture_output=True, text=True,
             timeout=60, check=False,
-            shell=(start_mode == "command"),
+            shell=(mode == "command"),
         )
     except Exception as exc:
-        buffer_debug(f"VM start failed: {exc}")
-        _update_dispatch_state(
-            last_vm_start_request_unix=now,
-            last_vm_start_mode=start_mode,
-            last_dispatch_error=f"VM start error: {exc}",
-        )
-        return False
+        buffer_debug(f"{action_label} failed: {exc}")
+        return False, f"{action_label} error: {exc}"
 
     if completed.stdout: print(completed.stdout, end="", flush=True)
     if completed.stderr: print(completed.stderr, end="", flush=True)
 
     if completed.returncode != 0:
-        buffer_debug(f"VM start command exited with {completed.returncode}")
-        _update_dispatch_state(
-            last_vm_start_request_unix=now,
-            last_vm_start_mode=start_mode,
-            last_dispatch_error=f"VM start exited {completed.returncode}",
-        )
+        buffer_debug(f"{action_label} exited with {completed.returncode}")
+        return False, f"{action_label} exited {completed.returncode}"
+    return True, ""
+
+
+def _request_vm_start(start_script, label, cooldown_key, start_command=""):
+    """Request a VM start, honouring a per-target cooldown so the GPU cooldown
+    does not block a CPU start attempt (and vice versa). cooldown_key namespaces
+    the last-start timestamp in dispatch state."""
+    now = int(time.time())
+    state = _dispatch_state()
+    last_key = f"last_vm_start_request_unix_{cooldown_key}"
+    last = int(state.get(last_key, state.get("last_vm_start_request_unix", 0)))
+    if now - last < PROCESSING_VM_START_COOLDOWN_SECONDS:
+        buffer_debug(f"{label} start skipped — within cooldown window")
         return False
 
-    _update_dispatch_state(
-        last_vm_start_request_unix=now,
-        last_vm_start_mode=start_mode,
-        last_dispatch_error="",
+    start_target, start_mode = _resolve_start_command(start_script, start_command)
+    if not start_target:
+        buffer_debug(f"No {label} start command configured")
+        _update_dispatch_state(**{
+            last_key: now,
+            "last_vm_start_request_unix": now,
+            "last_vm_start_mode": "missing",
+            "last_dispatch_error": f"No {label} start command configured",
+        })
+        return False
+
+    buffer_debug(f"Starting {label} via {start_mode}: {start_target}")
+    ok, err = _run_vm_subprocess(start_target, start_mode, f"{label} start")
+    _update_dispatch_state(**{
+        last_key: now,
+        "last_vm_start_request_unix": now,
+        "last_vm_start_mode": start_mode,
+        "last_dispatch_error": err,
+    })
+    return ok
+
+
+def _request_processing_vm_start():
+    """Backward-compatible GPU start wrapper."""
+    return _request_vm_start(
+        PROCESSING_VM_START_SCRIPT, "Processing TEE (GPU)", "gpu",
+        start_command=PROCESSING_VM_START_COMMAND,
     )
-    return True
+
+
+def _stop_vm(stop_script, label):
+    """Request a VM stop and wait (bounded by VM_STOP_WAIT_SECONDS) for it to
+    stop responding to healthchecks, so the following start is a clean boot.
+    A best-effort step: failures are logged but do not abort the retry."""
+    stop_target, stop_mode = _resolve_start_command(stop_script)
+    if not stop_target:
+        buffer_debug(f"No {label} stop command configured — skipping clean stop")
+        return False
+    buffer_debug(f"Stopping {label} via {stop_mode}: {stop_target}")
+    ok, err = _run_vm_subprocess(stop_target, stop_mode, f"{label} stop")
+    if not ok:
+        buffer_debug(f"{label} stop request did not succeed cleanly: {err}")
+    # Give the stop a bounded window to take effect. We don't have a status API
+    # here, so we simply pause; the subsequent start is idempotent regardless.
+    waited = 0
+    while waited < VM_STOP_WAIT_SECONDS:
+        time.sleep(min(PROCESSING_VM_BOOT_POLL_INTERVAL, VM_STOP_WAIT_SECONDS - waited))
+        waited += PROCESSING_VM_BOOT_POLL_INTERVAL
+    return ok
+
+
+def _wait_for_vm(healthcheck_url, timeout_seconds, label="Processing TEE"):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if _vm_is_healthy(healthcheck_url, label):
+            buffer_debug(f"{label} is healthy and ready")
+            return True
+        time.sleep(PROCESSING_VM_BOOT_POLL_INTERVAL)
+    buffer_debug(f"{label} did not become healthy within {timeout_seconds}s")
+    return False
 
 
 def _wait_for_processing_vm():
-    deadline = time.time() + PROCESSING_VM_BOOT_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        if _processing_vm_is_healthy():
-            buffer_debug("Processing TEE is healthy and ready")
-            return True
-        time.sleep(PROCESSING_VM_BOOT_POLL_INTERVAL)
-    buffer_debug(f"Processing TEE did not become healthy within {PROCESSING_VM_BOOT_TIMEOUT_SECONDS}s")
-    return False
+    """Backward-compatible GPU boot wait wrapper."""
+    return _wait_for_vm(
+        PROCESSING_RATLS_HEALTHCHECK_URL, PROCESSING_VM_BOOT_TIMEOUT_SECONDS,
+        "Processing TEE (GPU)",
+    )
+
+
+# ── Provisioning orchestration (GPU-first, 3-retry, CPU fallback) ──────────────
+
+def _try_cpu_fallback(job):
+    """Provision the CPU fallback Processing TEE. Returns (addr, digest) on
+    success or (None, None). The CPU VM is pre-provisioned and authorized, so
+    this starts it (it is not created on demand). Polled every tick until it
+    comes up — a job never auto-fails on provisioning."""
+    if not CPU_CS_ADDR:
+        buffer_debug("CPU fallback unavailable — CPU_CS_ADDR not configured")
+        _update_dispatch_state(
+            last_dispatch_status="cpu_unconfigured",
+            last_dispatch_error="CPU fallback requested but CPU_CS_ADDR is unset",
+        )
+        return None, None
+    if not CPU_CS_IMAGE_DIGEST:
+        buffer_debug("CPU fallback unavailable — CPU_CS_IMAGE_DIGEST not configured")
+        _update_dispatch_state(
+            last_dispatch_status="cpu_unconfigured",
+            last_dispatch_error="CPU fallback requested but CPU_CS_IMAGE_DIGEST is unset",
+        )
+        return None, None
+
+    job["provisioning_target"] = "cpu"
+    _save_job(job)
+
+    if _vm_is_healthy(CPU_RATLS_HEALTHCHECK_URL, "Processing TEE (CPU)"):
+        return CPU_CS_ADDR, CPU_CS_IMAGE_DIGEST
+
+    buffer_debug("CPU Processing TEE not healthy — requesting start")
+    _update_dispatch_state(
+        last_dispatch_status="awaiting_cpu",
+        last_dispatch_error="GPU exhausted; provisioning CPU fallback",
+    )
+    if _request_vm_start(CPU_VM_START_SCRIPT, "Processing TEE (CPU)", "cpu"):
+        if _wait_for_vm(CPU_RATLS_HEALTHCHECK_URL, CPU_VM_BOOT_TIMEOUT_SECONDS,
+                        "Processing TEE (CPU)"):
+            return CPU_CS_ADDR, CPU_CS_IMAGE_DIGEST
+    return None, None
+
+
+def _provision_processing_tee(job):
+    """Decide which Processing TEE to dispatch this job to.
+
+    Returns (ratls_addr, image_digest) for the healthy target, or (None, None)
+    if neither GPU nor CPU could be provisioned this cycle (the job stays queued
+    and the scheduler retries next tick).
+
+    GPU is attempted first via up to MAX_GPU_PROVISION_ATTEMPTS stop→start
+    cycles, counted per-job in job["gpu_provision_attempts"] (persisted each
+    attempt so a Buffer restart does not reset the count). Once the count is
+    exhausted, the job targets the CPU fallback directly — including on later
+    scheduler ticks — until the CPU VM comes up. The fallback is non-sticky:
+    each new job starts with gpu_provision_attempts == 0 and tries the GPU.
+    """
+    attempts = int(job.get("gpu_provision_attempts", 0))
+
+    # Already exhausted GPU on a previous tick → go straight to CPU.
+    if attempts >= MAX_GPU_PROVISION_ATTEMPTS:
+        buffer_debug(
+            f"Job {job['job_id']}: GPU attempts exhausted ({attempts}/"
+            f"{MAX_GPU_PROVISION_ATTEMPTS}) — targeting CPU fallback"
+        )
+        return _try_cpu_fallback(job)
+
+    # GPU already healthy → use it without consuming an attempt.
+    if _vm_is_healthy(PROCESSING_RATLS_HEALTHCHECK_URL, "Processing TEE (GPU)"):
+        job["provisioning_target"] = "gpu"
+        _save_job(job)
+        return PROCESSING_RATLS_ADDR, PROCESSING_EXPECTED_IMAGE_DIGEST
+
+    # GPU stop→start retry loop, capped, persisted per-job. An attempt is only
+    # counted when a start is actually issued — a start skipped by the cooldown
+    # does not burn an attempt (the scheduler simply retries on a later tick).
+    while int(job.get("gpu_provision_attempts", 0)) < MAX_GPU_PROVISION_ATTEMPTS:
+        prior_attempts = int(job.get("gpu_provision_attempts", 0))
+        attempt_no     = prior_attempts + 1
+        buffer_debug(
+            f"Job {job['job_id']}: GPU provision attempt "
+            f"{attempt_no}/{MAX_GPU_PROVISION_ATTEMPTS}"
+        )
+        _update_dispatch_state(
+            last_dispatch_status="provisioning_gpu",
+            last_dispatch_error=f"GPU attempt {attempt_no}/{MAX_GPU_PROVISION_ATTEMPTS}",
+        )
+        # On a retry (not the first attempt) do a clean stop→start so a VM stuck
+        # in a bad running state is rebooted. The first attempt of a cold cycle
+        # skips the stop — the VM is simply off and stopping wastes the wait.
+        if prior_attempts > 0:
+            _stop_vm(GPU_VM_STOP_SCRIPT, "Processing TEE (GPU)")
+        if not _request_vm_start(PROCESSING_VM_START_SCRIPT, "Processing TEE (GPU)",
+                                 "gpu", start_command=PROCESSING_VM_START_COMMAND):
+            # Start was skipped (cooldown) or unconfigured — no boot happened, so
+            # do NOT consume an attempt. Bail out; the scheduler retries next tick.
+            buffer_debug(
+                f"Job {job['job_id']}: GPU start not issued this tick "
+                f"(cooldown/unconfigured) — retrying next cycle"
+            )
+            return None, None
+        # A real start was issued → consume the attempt and persist it.
+        job["gpu_provision_attempts"] = attempt_no
+        job["provisioning_target"]    = "gpu"
+        _save_job(job)
+        if _wait_for_vm(PROCESSING_RATLS_HEALTHCHECK_URL,
+                        PROCESSING_VM_BOOT_TIMEOUT_SECONDS, "Processing TEE (GPU)"):
+            return PROCESSING_RATLS_ADDR, PROCESSING_EXPECTED_IMAGE_DIGEST
+
+    # GPU exhausted this cycle → fall back to CPU.
+    buffer_debug(
+        f"Job {job['job_id']}: GPU provisioning exhausted after "
+        f"{MAX_GPU_PROVISION_ATTEMPTS} attempts — falling back to CPU"
+    )
+    return _try_cpu_fallback(job)
 
 
 # ── RA-TLS dispatch ───────────────────────────────────────────────────────────
@@ -474,20 +671,29 @@ def _ratls_client_command():
     return ["go", "run", "./cmd/buffer-tee"], str(BUFFER_RATLS_CLIENT_WORKDIR)
 
 
-def _run_ratls_dispatch(job, payload_path):
-    if not PROCESSING_EXPECTED_IMAGE_DIGEST:
-        raise ValueError("GPU_CS_IMAGE_DIGEST must be set before dispatching")
+def _run_ratls_dispatch(job, payload_path, addr=None, image_digest=None):
+    """Dispatch a job to a Processing TEE over RA-TLS. addr/image_digest select
+    the target (GPU or CPU fallback); both default to the GPU target. The Go
+    RA-TLS client validates the server's attested image digest against
+    image_digest, so a CPU dispatch must pass the CPU image's digest."""
+    addr         = addr or PROCESSING_RATLS_ADDR
+    image_digest = image_digest or PROCESSING_EXPECTED_IMAGE_DIGEST
+    if not image_digest:
+        raise ValueError("Processing TEE image digest must be set before dispatching")
 
     command, override_workdir = _ratls_client_command()
     workdir = override_workdir or config.base_dir
     env = os.environ.copy()
-    env["GPU_CS_ADDR"]          = PROCESSING_RATLS_ADDR
+    env["GPU_CS_ADDR"]          = addr
     env["RATLS_AUDIENCE"]       = env.get("RATLS_AUDIENCE", "ratls-buffer-tee")
-    env["GPU_CS_IMAGE_DIGEST"]  = PROCESSING_EXPECTED_IMAGE_DIGEST
+    env["GPU_CS_IMAGE_DIGEST"]  = image_digest
     env["JOB_PAYLOAD_PATH"]     = str(payload_path)
     env.setdefault("GOTELEMETRY", "off")
 
-    buffer_debug(f"RA-TLS dispatch: {' '.join(command)} → job {job['job_id']}")
+    buffer_debug(
+        f"RA-TLS dispatch: {' '.join(command)} → job {job['job_id']} "
+        f"(target={job.get('provisioning_target', 'gpu')} addr={addr})"
+    )
     completed = subprocess.run(
         command, cwd=workdir, env=env,
         capture_output=True, text=True,
@@ -499,10 +705,10 @@ def _run_ratls_dispatch(job, payload_path):
         raise RuntimeError(f"RA-TLS dispatch failed (exit {completed.returncode})")
 
 
-def _mark_job_dispatched(job_id, payload_path):
+def _mark_job_dispatched(job_id, payload_path, addr=None):
     job = _load_job(job_id)
     job["status"]                  = "dispatched"
-    job["assigned_processing_tee"] = PROCESSING_RATLS_ADDR
+    job["assigned_processing_tee"] = addr or PROCESSING_RATLS_ADDR
     job["dispatched_at_unix"]      = int(time.time())
     job["updated_at_unix"]         = int(time.time())
     job["delivery"] = {"mode": "ratls_json_payload", "payload_path": str(payload_path)}
@@ -550,9 +756,13 @@ def _requeue_orphaned_dispatched_jobs():
         if payload is not None:
             _cache_results_locally(job_id, payload)
             continue
-        # No results yet. If the Processing TEE is still healthy, an eval may be
-        # in flight — leave it alone. Otherwise the VM is gone: requeue.
-        if _processing_vm_is_healthy():
+        # No results yet. If the Processing TEE that this job was dispatched to
+        # is still healthy, an eval may be in flight — leave it alone. Otherwise
+        # the VM is gone: requeue. Probe the assigned TEE (GPU or CPU fallback),
+        # not just the GPU, so a healthy CPU eval is never wrongly requeued.
+        assigned_addr = job.get("assigned_processing_tee", "") or PROCESSING_RATLS_ADDR
+        assigned_healthcheck_url = f"https://{assigned_addr}/healthz"
+        if _vm_is_healthy(assigned_healthcheck_url, f"Processing TEE ({assigned_addr})"):
             continue
         with job_file_lock:
             current = _load_job(job_id)
@@ -562,6 +772,11 @@ def _requeue_orphaned_dispatched_jobs():
             current["updated_at_unix"] = now
             current["requeued_at_unix"] = now
             current["requeue_count"]   = int(current.get("requeue_count", 0)) + 1
+            # A job orphaned by a crash had already provisioned successfully; the
+            # failure was a dead VM, not a provisioning failure. Reset the GPU
+            # attempt counter so the requeued job tries the GPU first again
+            # rather than skipping straight to CPU fallback.
+            current["gpu_provision_attempts"] = 0
             _save_job(current)
             _queue_job(current)
         requeued.append(job_id)
@@ -584,8 +799,9 @@ def dispatch_next_queued_job():
 
     1. Recover any jobs orphaned by a dead Processing TEE.
     2. Skip if another job is already (still legitimately) dispatched.
-    3. Healthcheck the Processing TEE; start it if not running.
-    4. Build the secure payload and dispatch via RA-TLS.
+    3. Provision a Processing TEE for the job: GPU first (up to
+       MAX_GPU_PROVISION_ATTEMPTS stop→start cycles), then CPU fallback.
+    4. Build the secure payload and dispatch via RA-TLS to the chosen target.
     """
     _ensure_dirs()
 
@@ -608,12 +824,17 @@ def dispatch_next_queued_job():
         last_dispatch_error="",
     )
 
-    if not _processing_vm_is_healthy():
-        buffer_debug("Processing TEE not healthy — requesting start")
-        if not _request_processing_vm_start():
-            return
-        if not _wait_for_processing_vm():
-            return
+    # GPU-first provisioning with a capped stop→start retry, then CPU fallback.
+    # Returns the chosen target's RA-TLS addr + expected image digest, or
+    # (None, None) if neither could be provisioned this tick (job stays queued
+    # and the next scheduler tick retries — the per-job attempt count persists).
+    addr, image_digest = _provision_processing_tee(job)
+    if not addr:
+        buffer_debug(
+            f"Job {job['job_id']}: no Processing TEE available this cycle — "
+            f"leaving queued for retry"
+        )
+        return
 
     with job_file_lock:
         current = _next_queued_job()
@@ -622,7 +843,7 @@ def dispatch_next_queued_job():
         payload_path, _ = _write_secure_dispatch_payload(current)
 
     try:
-        _run_ratls_dispatch(job, payload_path)
+        _run_ratls_dispatch(job, payload_path, addr=addr, image_digest=image_digest)
     except Exception as exc:
         buffer_debug(f"RA-TLS dispatch failed for {job['job_id']}: {exc}")
         _update_dispatch_state(
@@ -634,7 +855,7 @@ def dispatch_next_queued_job():
         return
 
     with job_file_lock:
-        _mark_job_dispatched(job["job_id"], payload_path)
+        _mark_job_dispatched(job["job_id"], payload_path, addr=addr)
 
     _update_dispatch_state(
         last_dispatch_attempt_unix=int(time.time()),

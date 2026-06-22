@@ -31,8 +31,8 @@ ENV PYTHONUNBUFFERED=1 \
     BUFFER_BOOTSTRAP_PLACEHOLDER_QUEUE=0 \
     SCHEDULER_INTERVAL_SECONDS=15 \
     RATLS_SERVER_AUDIENCE=ratls-browser \
-    TLS_CERT=/app/certs/tls.crt \
-    TLS_KEY=/app/certs/tls.key
+    TLS_CERT=/run/certs/tls.crt \
+    TLS_KEY=/run/certs/tls.key
 
 WORKDIR /app
 
@@ -51,12 +51,11 @@ RUN python -m pip install --upgrade pip \
 COPY . /app
 COPY --from=ratls-client-builder /out/buffer-tee /usr/local/bin/buffer-tee
 COPY --from=ratls-server-builder /out/buffer-server /usr/local/bin/buffer-server
-COPY Tanuh-buffer-tee-ratls/enclave/certs /app/certs
 
 RUN chmod +x /app/entrypoint.sh /usr/local/bin/buffer-tee /usr/local/bin/buffer-server \
     && mkdir -p /app/cvm_workflow/buffer /app/cvm_workflow/tls /app/cvm_workflow/logs
 
-LABEL "tee.launch_policy.allow_env_override"="RATLS_SERVER_AUDIENCE,TLS_CERT,TLS_KEY,GPU_CS_IMAGE_DIGEST,KEYCLOAK_JWKS_URL,KEYCLOAK_ISSUER"
+LABEL "tee.launch_policy.allow_env_override"="RATLS_SERVER_AUDIENCE,TLS_CERT,TLS_KEY,GPU_CS_IMAGE_DIGEST,KEYCLOAK_JWKS_URL,KEYCLOAK_ISSUER,CPU_CS_ADDR,CPU_CS_IMAGE_DIGEST"
 
 EXPOSE 4100 8443
 
