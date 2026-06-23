@@ -40,7 +40,7 @@ type ChunkedUploadHeader struct {
 	FileID          string `json:"file_id"`
 	Enc             string `json:"enc"`              // base64std HPKE encapsulated key (32 bytes)
 	WrappedKey      string `json:"wrapped_key"`      // base64std HPKE-wrapped AES-256 key (48 bytes)
-	FileNonce       string `json:"file_nonce"`       // base64std 8-byte random nonce
+	BaseIV          string `json:"base_iv"`          // base64std 12-byte base IV; chunk i uses BaseIV+i (96-bit big-endian)
 	TotalChunks     int    `json:"total_chunks"`
 	PlaintextSHA256 string `json:"plaintext_sha256"` // hex SHA256 of assembled plaintext
 }
@@ -165,7 +165,7 @@ func (s *Server) HandleUploadPreprocessing(w http.ResponseWriter, r *http.Reques
 //	  [4 bytes big-endian: ciphertext length]
 //	  [ciphertext bytes]  (plaintext + 16-byte GCM tag)
 //
-// Per-chunk nonce: fileNonce(8) || uint32BE(i)(4) = 12 bytes
+// Per-chunk IV: baseIV + i (96-bit big-endian increment of the 12-byte base IV)
 // Per-chunk AAD:   "{i}:{totalChunks}:{fileId}" as UTF-8
 func (s *Server) decryptChunkedUpload(body io.Reader, browserPubB64u string) ([]byte, error) {
 	if browserPubB64u == "" {
@@ -209,9 +209,9 @@ func (s *Server) decryptChunkedUpload(body io.Reader, browserPubB64u string) ([]
 	if err != nil {
 		return nil, fmt.Errorf("decode wrapped_key: %w", err)
 	}
-	fileNonce, err := base64.StdEncoding.DecodeString(hdr.FileNonce)
-	if err != nil || len(fileNonce) != 8 {
-		return nil, fmt.Errorf("bad file_nonce: must be 8 bytes")
+	baseIV, err := base64.StdEncoding.DecodeString(hdr.BaseIV)
+	if err != nil || len(baseIV) != 12 {
+		return nil, fmt.Errorf("bad base_iv: must be 12 bytes")
 	}
 
 	// HPKE-unwrap the symmetric key (no AAD — key wrapping uses info binding only)
@@ -238,9 +238,9 @@ func (s *Server) decryptChunkedUpload(body io.Reader, browserPubB64u string) ([]
 		return nil, fmt.Errorf("cipher.NewGCM: %w", err)
 	}
 
-	// Decrypt chunks
+	// Decrypt chunks; nonce starts at baseIV and increments by 1 (big-endian) each chunk.
 	nonce := make([]byte, 12)
-	copy(nonce[:8], fileNonce)
+	copy(nonce, baseIV)
 	var assembled []byte
 
 	for i := 0; i < hdr.TotalChunks; i++ {
@@ -253,7 +253,6 @@ func (s *Server) decryptChunkedUpload(body io.Reader, browserPubB64u string) ([]
 			return nil, fmt.Errorf("read chunk %d data: %w", i, err)
 		}
 
-		binary.BigEndian.PutUint32(nonce[8:], uint32(i))
 		aad := []byte(fmt.Sprintf("%d:%d:%s", i, hdr.TotalChunks, hdr.FileID))
 
 		pt, err := gcm.Open(nil, nonce, ct, aad)
@@ -261,6 +260,14 @@ func (s *Server) decryptChunkedUpload(body io.Reader, browserPubB64u string) ([]
 			return nil, fmt.Errorf("chunk %d authentication failed", i)
 		}
 		assembled = append(assembled, pt...)
+
+		// increment nonce by 1 (big-endian, with carry) for the next chunk
+		for j := 11; j >= 0; j-- {
+			nonce[j]++
+			if nonce[j] != 0 {
+				break
+			}
+		}
 	}
 
 	// Verify SHA-256 of assembled plaintext against header commitment
