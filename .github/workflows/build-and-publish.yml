@@ -6,7 +6,7 @@ on:
 
 env:
   REGISTRY: us-central1-docker.pkg.dev
-  IMAGE:    us-central1-docker.pkg.dev/p3dx-depa-sandbox/ratls-enclave/buffer-tee
+  IMAGE:    us-central1-docker.pkg.dev/p3dx-depa-sandbox/ratls/buffer-tee
 
 jobs:
   build-and-publish:
