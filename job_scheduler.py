@@ -6,13 +6,11 @@ import threading
 import time
 from pathlib import Path
 
-import requests
-import tee_tls
 from lib.buffer_lock import job_file_lock
 from lib.config import config
 
 
-SCHEDULER_INTERVAL_SECONDS    = int(os.getenv("SCHEDULER_INTERVAL_SECONDS",    "30"))
+SCHEDULER_INTERVAL_SECONDS    = int(os.getenv("SCHEDULER_INTERVAL_SECONDS",    "15"))
 DISPATCH_TIMEOUT_SECONDS      = int(os.getenv("DISPATCH_TIMEOUT_SECONDS",      "600"))
 JOB_RETENTION_SECONDS         = int(os.getenv("JOB_RETENTION_SECONDS",         "86400"))
 QUEUE_STALL_THRESHOLD_SECONDS = int(os.getenv("QUEUE_STALL_THRESHOLD_SECONDS", "300"))
@@ -107,59 +105,6 @@ def _handle_dispatch_timeouts() -> None:
         _json_dump(metadata_path, job)
         _requeue_job_id(job_id)
 
-# Poll processing TEE for results on dispatched jobs
-
-def _poll_dispatched_for_results() -> None:
-    for metadata_path in _all_job_metadata_paths():
-        try:
-            job = _json_load(metadata_path)
-        except Exception:
-            continue
-
-        if job.get("status") != "dispatched":
-            continue
-
-        results_url = job.get("processing_tee_results_url", "").strip()
-        if not results_url:
-            continue
-
-        job_id = job["job_id"]
-        try:
-            response = requests.get(
-                results_url,
-                timeout=15,
-                **tee_tls.requests_kwargs("buffer-client"),
-            )
-        except Exception as exc:
-            logging.warning("[scheduler] Poll GET %s for job %s failed: %s", results_url, job_id, exc)
-            continue
-
-        if response.status_code == 404:
-            logging.debug("[scheduler] Job %s still processing (404 from %s)", job_id, results_url)
-            continue
-
-        if response.status_code != 200:
-            logging.warning(
-                "[scheduler] Unexpected %d polling %s for job %s — will retry next tick",
-                response.status_code, results_url, job_id,
-            )
-            continue
-
-        try:
-            results_payload = response.json()
-        except Exception as exc:
-            logging.error("[scheduler] Non-JSON 200 body from %s for job %s: %s", results_url, job_id, exc)
-            continue
-
-        results_path = _job_results_path(job_id)
-        _json_dump(results_path, results_payload)
-        job["status"] = "complete"
-        job["updated_at_unix"] = int(time.time())
-        job["results_path"] = str(results_path)
-        job["results_source"] = "scheduler_poll"
-        _json_dump(metadata_path, job)
-        logging.info("[scheduler] Job %s marked complete via poll from %s", job_id, results_url)
-
 # Delete job directories past the retention window
 
 def _cleanup_old_jobs() -> None:
@@ -224,7 +169,6 @@ def _scheduler_loop() -> None:
         try:
             with job_file_lock:
                 _handle_dispatch_timeouts()
-                _poll_dispatched_for_results()
                 _cleanup_old_jobs()
                 _check_queue_health()
         except Exception:
