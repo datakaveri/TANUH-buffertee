@@ -4,7 +4,7 @@ set -eu
 
 PROJECT="${PROJECT:-p3dx-depa-sandbox}"
 ZONE="${ZONE:-us-central1-a}"
-INSTANCE="${INSTANCE:-cpu-cs-snp}"
+INSTANCE="${CPU_CS_INSTANCE:-cpu-cs-snp}"
 
 TOKEN="$(curl -s -H 'Metadata-Flavor: Google' \
   'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \

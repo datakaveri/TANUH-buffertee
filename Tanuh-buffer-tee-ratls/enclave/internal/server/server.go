@@ -27,7 +27,7 @@ func New(b *bundle.Builder, auth AuthConfig) *Server {
 	s.mux.HandleFunc("PUT /v1/upload/{job_id}/weights",        s.HandleUploadWeights)
 	s.mux.HandleFunc("PUT /v1/upload/{job_id}/preprocessing",  s.HandleUploadPreprocessing)
 	s.mux.HandleFunc("GET /v1/status/{job_id}",           s.HandleStatus)
-	s.mux.HandleFunc("GET /v1/queue",                     s.HandleQueue)
+	s.mux.Handle("GET /v1/queue",                         requireRole("org_admin", http.HandlerFunc(s.HandleQueue)))
 	s.mux.HandleFunc("GET /v1/results/{job_id}",          s.HandleResults)
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

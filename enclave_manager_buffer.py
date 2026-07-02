@@ -8,10 +8,10 @@ Flow:
   3. buffer-server decrypts inside the SEV-SNP TEE, then POSTs to /buffer/jobs here.
   4. job_scheduler.py dispatches the job to the Processing TEE via RA-TLS
      (buffer-tee Go client → gpu-cs Go server on port 443).
-  5. Processing TEE decrypts dataset, runs ONNX inference, uploads results to GCS,
-     then self-deallocates.
-  6. Buffer TEE polls GCS for results on GET /v1/results/{job_id} and returns them
-     to the browser.
+  5. Processing TEE decrypts dataset, runs ONNX inference, exposes results over
+     its RA-TLS results endpoint, then self-deallocates.
+  6. job_scheduler.py polls the Processing TEE for results and writes them to
+     local disk; GET /v1/results/{job_id} serves them to the browser.
 """
 
 import base64
@@ -104,17 +104,15 @@ CPU_CS_IMAGE_DIGEST               = os.getenv("CPU_CS_IMAGE_DIGEST", "")
 # How long to wait for a VM to reach a stopped/TERMINATED state before restarting
 # it during a retry cycle. Bounded so a stuck stop never hangs the scheduler.
 VM_STOP_WAIT_SECONDS              = int(os.getenv("VM_STOP_WAIT_SECONDS", "60"))
-# A job marked "dispatched" whose Processing TEE died before uploading results
+# A job marked "dispatched" whose Processing TEE died before producing results
 # would otherwise block the scheduler forever. If results are still absent from
-# GCS, the VM is unhealthy, and at least this many seconds have passed since
-# dispatch, treat the job as orphaned and requeue it for re-dispatch.
+# local disk, the VM is unhealthy, and at least this many seconds have passed
+# since dispatch, treat the job as orphaned and requeue it for re-dispatch.
 DISPATCH_ORPHAN_GRACE_SECONDS       = int(os.getenv("DISPATCH_ORPHAN_GRACE_SECONDS", "60"))
 
 BUFFER_RATLS_CLIENT_BIN    = os.getenv("BUFFER_RATLS_CLIENT_BIN", "")
 BUFFER_RATLS_CLIENT_WORKDIR = Path(os.getenv("BUFFER_RATLS_CLIENT_WORKDIR",
                                               str(Path(config.base_dir) / "b2p-ratls")))
-
-GCS_RESULTS_BUCKET = os.getenv("GCS_RESULTS_BUCKET", "p3dx-tanuh-results")
 
 import subprocess, sys
 
@@ -278,6 +276,7 @@ def _create_job_record(content):
         "weights_file":      WEIGHTS_FILE_NAME,
         "artifact_dir":      str(job_dir / "artifacts"),
         "submitted_by":      content.get("submitted_by", "unknown"),
+        "keycloak_token":    content.get("keycloak_token", ""),
         "model_sha256_expected":          content.get("model_sha256", ""),
         "weights_sha256_expected":        content.get("weights_sha256", ""),
         "preprocessing_sha256_expected":  content.get("preprocessing_sha256", ""),
@@ -637,6 +636,8 @@ def _build_secure_dispatch_payload(job):
         "job_id":            job["job_id"],
         "dataset_id":        job["dataset_id"],
         "submitted_at_unix": job["submitted_at_unix"],
+        "submitted_by":      job.get("submitted_by", ""),
+        "keycloak_token":    job.get("keycloak_token", ""),
         "hyperparameters":   job["hyperparameters"],
         "model_file":        MODEL_FILE_NAME,
         "weights_file":      WEIGHTS_FILE_NAME,
@@ -726,7 +727,7 @@ def _requeue_orphaned_dispatched_jobs():
     queue and would otherwise block the scheduler forever.
 
     A dispatched job is considered orphaned when ALL of:
-      - its results are not yet present in GCS, and
+      - its results are not yet present on local disk, and
       - the dispatch happened at least DISPATCH_ORPHAN_GRACE_SECONDS ago, and
       - the Processing TEE is not currently healthy (a live eval keeps it up).
 
@@ -747,14 +748,9 @@ def _requeue_orphaned_dispatched_jobs():
         job_id = job.get("job_id")
         if now - int(job.get("dispatched_at_unix", 0)) < DISPATCH_ORPHAN_GRACE_SECONDS:
             continue
-        # If results have landed in GCS, the job is actually complete — cache and skip.
-        try:
-            payload = _fetch_results_from_gcs(job_id)
-        except Exception as exc:
-            buffer_debug(f"Orphan check: GCS fetch for {job_id} failed: {exc}")
-            payload = None
-        if payload is not None:
-            _cache_results_locally(job_id, payload)
+        # If results have already landed on local disk (scheduler poll), the job
+        # is actually complete — skip requeue.
+        if _job_results_path(job_id).exists():
             continue
         # No results yet. If the Processing TEE that this job was dispatched to
         # is still healthy, an eval may be in flight — leave it alone. Otherwise
@@ -866,55 +862,6 @@ def dispatch_next_queued_job():
     buffer_debug(f"Job {job['job_id']} dispatched successfully via RA-TLS")
 
 
-# ── Results — GCS fetch ────────────────────────────────────────────────────────
-
-def _fetch_results_from_gcs(job_id):
-    """
-    Download results.json for job_id from GCS.
-    Returns the parsed dict on success, None if the object doesn't exist yet,
-    or raises on unexpected errors.
-    """
-    from google.cloud import storage as gcs
-    blob_name = f"results/{job_id}/results.json"
-    client    = gcs.Client()
-    bucket    = client.bucket(GCS_RESULTS_BUCKET)
-    blob      = bucket.blob(blob_name)
-    if not blob.exists():
-        return None
-    return json.loads(blob.download_as_text())
-
-
-def _cache_results_locally(job_id, results_payload):
-    """Persist GCS-fetched results (or an error report) to disk and update the
-    job status. The Processing TEE writes an error payload (status="error") to
-    the same GCS location on failure, so a fetched payload may be either."""
-    _ensure_dirs()
-    results_path = _job_results_path(job_id)
-    _json_dump(results_path, results_payload)
-
-    is_error  = isinstance(results_payload, dict) and results_payload.get("status") == "error"
-    job_status = "error" if is_error else "complete"
-
-    with job_file_lock:
-        job = _load_job(job_id)
-        job["status"]          = job_status
-        job["updated_at_unix"] = int(time.time())
-        job["results_path"]    = str(results_path)
-        job["gcs_results_uri"] = f"gs://{GCS_RESULTS_BUCKET}/results/{job_id}/results.json"
-        if is_error:
-            job["last_error"] = results_payload.get("error", "")
-        _save_job(job)
-        _update_dispatch_state(
-            last_dispatch_attempt_unix=int(time.time()),
-            last_dispatch_job_id=job_id,
-            last_dispatch_status=("job_failed" if is_error else "results_received"),
-            last_dispatch_error=(results_payload.get("error", "") if is_error else ""),
-        )
-    buffer_debug(
-        f"{'Error report' if is_error else 'Results'} cached locally for job {job_id}"
-    )
-
-
 # ── Flask routes ──────────────────────────────────────────────────────────────
 
 @app.route("/buffer/jobs", methods=["POST"])
@@ -988,9 +935,11 @@ def list_jobs():
     _ensure_dirs()
     jobs = [_json_load(p) for p in sorted(BUFFER_JOBS_DIR.glob("*/job.json"))]
     queue = _read_queue()
+    queued_ids = queue.get("queued_job_ids", [])
     return jsonify({
         "status":         "success",
-        "queued_job_ids": queue.get("queued_job_ids", []),
+        "queued_count":   len(queued_ids),
+        "queued_job_ids": queued_ids,
         "jobs":           jobs,
     }), 200
 
@@ -1016,32 +965,19 @@ def get_job_artifact(job_id, artifact_name):
 def get_job_results(job_id):
     """Return inference results for a completed job.
 
-    Checks local disk cache first; on miss, polls GCS directly.
-    When GCS has the object the results are cached locally and returned.
+    Results are written to local disk by the scheduler poll once the Processing
+    TEE reports them; a miss means they haven't arrived yet.
     """
     job_path = _job_metadata_path(job_id)
     if not job_path.exists():
         return jsonify({"status": "error", "message": "Unknown job_id"}), 404
 
-    # Fast path: already cached from a previous fetch
     results_path = _job_results_path(job_id)
     if results_path.exists():
         return jsonify(_json_load(results_path)), 200
 
-    # Slow path: ask GCS
-    try:
-        payload = _fetch_results_from_gcs(job_id)
-    except Exception as exc:
-        buffer_debug(f"GCS fetch for {job_id} failed: {exc}")
-        job = _json_load(job_path)
-        return jsonify({"status": job.get("status", "unknown"), "message": "results not yet available"}), 404
-
-    if payload is None:
-        job = _json_load(job_path)
-        return jsonify({"status": job.get("status", "unknown"), "message": "results not yet available"}), 404
-
-    _cache_results_locally(job_id, payload)
-    return jsonify(payload), 200
+    job = _json_load(job_path)
+    return jsonify({"status": job.get("status", "unknown"), "message": "results not yet available"}), 404
 
 
 @app.route("/buffer/dispatch/state", methods=["GET"])
@@ -1063,7 +999,6 @@ if __name__ == "__main__":
     print(f"  Flask (internal):   http://0.0.0.0:{BUFFER_TEE_PORT}")
     print(f"  RA-TLS server:      https://0.0.0.0:8443  (buffer-server)")
     print(f"  Processing TEE:     {PROCESSING_RATLS_ADDR}")
-    print(f"  GCS results bucket: gs://{GCS_RESULTS_BUCKET}")
     print("=" * 60)
 
     job_scheduler.set_dispatch_callback(dispatch_next_queued_job)

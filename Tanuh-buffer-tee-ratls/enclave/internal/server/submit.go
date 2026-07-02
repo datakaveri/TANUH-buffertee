@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/datakaveri/tanuh-buffer-tee/internal/bundle"
@@ -33,6 +34,26 @@ type JobRequest struct {
 	ModelSHA256         string `json:"model_sha256"`             // hex SHA256 of model.onnx plaintext
 	WeightsSHA256       string `json:"weights_sha256"`           // hex SHA256 of weights plaintext
 	PreprocessingSHA256 string `json:"preprocessing_sha256,omitempty"` // hex SHA256 of preprocessing.py (dataset_id=2)
+}
+
+// extractKeycloakSub decodes the JWT payload (already validated by middleware)
+// and returns the "sub" claim, or empty string on any error.
+func extractKeycloakSub(tokenStr string) string {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	return claims.Sub
 }
 
 // ChunkedUploadHeader is Frame 0 of the AES-256-GCM-CHUNKED-v1 stream.
@@ -98,7 +119,9 @@ func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := processJob(plaintext)
+	rawKeycloakToken := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	keycloakSub := extractKeycloakSub(rawKeycloakToken)
+	response := processJob(plaintext, keycloakSub, rawKeycloakToken)
 
 	rid := r.Header.Get("X-Request-Id")
 	respAAD := []byte(fmt.Sprintf(`{"rid":%q,"ts":%d}`, rid, time.Now().Unix()))
@@ -305,7 +328,7 @@ func proxyPlaintextUpload(w http.ResponseWriter, url string, data []byte) {
 	io.Copy(w, resp.Body) //nolint:errcheck
 }
 
-func processJob(plaintext []byte) []byte {
+func processJob(plaintext []byte, keycloakSub string, keycloakToken string) []byte {
 	var jobReq JobRequest
 	if err := json.Unmarshal(plaintext, &jobReq); err != nil {
 		return jsonErr("invalid job payload: " + err.Error())
@@ -315,9 +338,11 @@ func processJob(plaintext []byte) []byte {
 	}
 
 	flaskData := map[string]interface{}{
-		"dataset_id":     jobReq.DatasetID,
-		"model_sha256":   jobReq.ModelSHA256,
-		"weights_sha256": jobReq.WeightsSHA256,
+		"dataset_id":      jobReq.DatasetID,
+		"model_sha256":    jobReq.ModelSHA256,
+		"weights_sha256":  jobReq.WeightsSHA256,
+		"submitted_by":    keycloakSub,
+		"keycloak_token":  keycloakToken,
 	}
 	if jobReq.PreprocessingSHA256 != "" {
 		flaskData["preprocessing_sha256"] = jobReq.PreprocessingSHA256

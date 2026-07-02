@@ -55,7 +55,7 @@ COPY --from=ratls-server-builder /out/buffer-server /usr/local/bin/buffer-server
 RUN chmod +x /app/entrypoint.sh /usr/local/bin/buffer-tee /usr/local/bin/buffer-server \
     && mkdir -p /app/cvm_workflow/buffer /app/cvm_workflow/tls /app/cvm_workflow/logs
 
-LABEL "tee.launch_policy.allow_env_override"="RATLS_SERVER_AUDIENCE,TLS_CERT,TLS_KEY,GPU_CS_IMAGE_DIGEST,KEYCLOAK_JWKS_URL,KEYCLOAK_ISSUER,CPU_CS_ADDR,CPU_CS_IMAGE_DIGEST"
+LABEL "tee.launch_policy.allow_env_override"="RATLS_SERVER_AUDIENCE,TLS_CERT,TLS_KEY,GPU_CS_IMAGE_DIGEST,KEYCLOAK_JWKS_URL,KEYCLOAK_ISSUER,CPU_CS_ADDR,CPU_CS_IMAGE_DIGEST,CPU_CS_INSTANCE,CPU_CS_ZONE,MAX_GPU_PROVISION_ATTEMPTS,PROCESSING_VM_BOOT_TIMEOUT_SECONDS"
 
 EXPOSE 4100 8443
 

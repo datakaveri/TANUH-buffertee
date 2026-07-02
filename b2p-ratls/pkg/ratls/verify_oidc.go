@@ -124,14 +124,9 @@ func VerifyOIDCToken(tokenString, expectedAudience string, leeway time.Duration)
 }
 
 func getRSAPublicKeyFromJWKS(t *jwt.Token) (any, error) {
-	wk, err := getWellKnown()
+	resp, err := http.Get(GCPCSJwksURL) //nolint:noctx
 	if err != nil {
-		return nil, fmt.Errorf("get well-known: %w", err)
-	}
-
-	resp, err := http.Get(wk.JwksURI) //nolint:noctx
-	if err != nil {
-		return nil, fmt.Errorf("fetch JWKS from %s: %w", wk.JwksURI, err)
+		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}
 	defer resp.Body.Close()
 

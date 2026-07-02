@@ -199,6 +199,46 @@ func validateKeycloakJWT(tokenStr, jwksURL, issuer string) error {
 	return nil
 }
 
+// jwtRealmRoles decodes the payload of an already-validated JWT and returns
+// the roles listed under realm_access.roles (Keycloak standard claim).
+// The signature is NOT re-verified — call only after keycloakAuthMiddleware.
+func jwtRealmRoles(tokenStr string) []string {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims struct {
+		RealmAccess struct {
+			Roles []string `json:"roles"`
+		} `json:"realm_access"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil
+	}
+	return claims.RealmAccess.Roles
+}
+
+// requireRole wraps a handler and returns 403 if the caller's JWT does not
+// carry the given Keycloak realm role. Must sit inside keycloakAuthMiddleware
+// so the token is already signature-verified.
+func requireRole(role string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+		for _, realmRole := range jwtRealmRoles(token) {
+			if realmRole == role {
+				next.ServeHTTP(w, req)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+	})
+}
+
 // keycloakAuthMiddleware enforces Keycloak JWT auth on all routes except
 // OPTIONS (CORS preflight) and /healthz.
 func keycloakAuthMiddleware(jwksURL, issuer string, next http.Handler) http.Handler {

@@ -12,6 +12,10 @@ const (
 	MetadataTokenSocketPath  = "/run/container_launcher/teeserver.sock"
 	GCPCSIssuer           = "https://confidentialcomputing.googleapis.com"
 	WellKnownPath         = "/.well-known/openid-configuration"
+	// GCPCSJwksURL is the stable JWKS URI for GCP Confidential Space OIDC tokens.
+	// Hardcoded to avoid fetching .well-known/openid-configuration, which may be
+	// blocked by VPC Service Controls (restricted.googleapis.com DNS routing).
+	GCPCSJwksURL          = "https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com"
 	TDXHWModelPrefix      = "GCP_INTEL_TDX"
 	SEVHWModelPrefix      = "GCP_AMD_SEV"
 	CSSwName              = "CONFIDENTIAL_SPACE"
