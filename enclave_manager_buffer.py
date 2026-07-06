@@ -720,21 +720,29 @@ def _mark_job_dispatched(job_id, payload_path, addr=None):
 
 # ── Main scheduler dispatch callback ─────────────────────────────────────────
 
-def _requeue_orphaned_dispatched_jobs():
+def _finalize_dispatched_jobs():
     """
-    Recover jobs stuck in "dispatched" because the Processing TEE died before
-    uploading results (e.g. mid-eval shutdown). Such a job is removed from the
-    queue and would otherwise block the scheduler forever.
+    Mark dispatched jobs complete once their Processing TEE has finished.
 
-    A dispatched job is considered orphaned when ALL of:
-      - its results are not yet present on local disk, and
+    In the current design the Processing TEE delivers results to the external
+    leaderboard and then self-deallocates; it does NOT report completion back to
+    the buffer. So a job that was dispatched and whose Processing TEE is no
+    longer running is DONE — not orphaned. Marking it "complete" drains the
+    queue and prevents the scheduler from re-dispatching (and re-running) it.
+
+    TEMPORARY stop-gap (fire-and-forget): the buffer cannot distinguish a clean
+    finish from a mid-eval crash this way. The proper fix is a completion
+    callback from the Processing TEE to buffer_job_url (already forwarded in the
+    dispatch payload) carrying the real terminal status, which would let us
+    requeue only genuine failures. See _run_ratls_dispatch / _build_secure_dispatch_payload.
+
+    A dispatched job is finalized when BOTH:
       - the dispatch happened at least DISPATCH_ORPHAN_GRACE_SECONDS ago, and
-      - the Processing TEE is not currently healthy (a live eval keeps it up).
-
-    Orphaned jobs are reset to "queued" and re-added to the queue. Returns the
-    list of requeued job_ids.
+      - the assigned Processing TEE is not currently healthy (a live eval keeps
+        it up — those are left running).
+    Returns the list of finalized job_ids.
     """
-    requeued = []
+    finalized = []
     now = int(time.time())
     with job_file_lock:
         dispatched = [
@@ -742,51 +750,41 @@ def _requeue_orphaned_dispatched_jobs():
             if _json_load(p).get("status") == "dispatched"
         ]
     if not dispatched:
-        return requeued
+        return finalized
 
     for job in dispatched:
         job_id = job.get("job_id")
         if now - int(job.get("dispatched_at_unix", 0)) < DISPATCH_ORPHAN_GRACE_SECONDS:
             continue
-        # If results have already landed on local disk (scheduler poll), the job
-        # is actually complete — skip requeue.
-        if _job_results_path(job_id).exists():
-            continue
-        # No results yet. If the Processing TEE that this job was dispatched to
-        # is still healthy, an eval may be in flight — leave it alone. Otherwise
-        # the VM is gone: requeue. Probe the assigned TEE (GPU or CPU fallback),
-        # not just the GPU, so a healthy CPU eval is never wrongly requeued.
+        # If the assigned Processing TEE is still healthy, an eval may be in
+        # flight — leave it alone. Probe the assigned TEE (GPU or CPU fallback),
+        # not just the GPU, so a live CPU eval is never finalized prematurely.
         assigned_addr = job.get("assigned_processing_tee", "") or PROCESSING_RATLS_ADDR
         assigned_healthcheck_url = f"https://{assigned_addr}/healthz"
         if _vm_is_healthy(assigned_healthcheck_url, f"Processing TEE ({assigned_addr})"):
             continue
+        # TEE has finished and self-deallocated → the job is done.
         with job_file_lock:
             current = _load_job(job_id)
             if current.get("status") != "dispatched":
                 continue
-            current["status"]         = "queued"
-            current["updated_at_unix"] = now
-            current["requeued_at_unix"] = now
-            current["requeue_count"]   = int(current.get("requeue_count", 0)) + 1
-            # A job orphaned by a crash had already provisioned successfully; the
-            # failure was a dead VM, not a provisioning failure. Reset the GPU
-            # attempt counter so the requeued job tries the GPU first again
-            # rather than skipping straight to CPU fallback.
-            current["gpu_provision_attempts"] = 0
+            current["status"]            = "complete"
+            current["updated_at_unix"]   = now
+            current["completed_at_unix"] = now
+            current["completion_source"] = "dispatch_finalized"
             _save_job(current)
-            _queue_job(current)
-        requeued.append(job_id)
+        finalized.append(job_id)
         buffer_debug(
-            f"Requeued orphaned job {job_id} — Processing TEE died before "
-            f"results upload (requeue #{current['requeue_count']})"
+            f"Finalized job {job_id} as complete — Processing TEE finished and "
+            f"self-deallocated (results delivered to the leaderboard)"
         )
         _update_dispatch_state(
             last_dispatch_attempt_unix=now,
             last_dispatch_job_id=job_id,
-            last_dispatch_status="requeued_orphan",
-            last_dispatch_error="processing TEE died before results upload",
+            last_dispatch_status="finalized_complete",
+            last_dispatch_error="",
         )
-    return requeued
+    return finalized
 
 
 def dispatch_next_queued_job():
@@ -801,7 +799,7 @@ def dispatch_next_queued_job():
     """
     _ensure_dirs()
 
-    _requeue_orphaned_dispatched_jobs()
+    _finalize_dispatched_jobs()
 
     with job_file_lock:
         if any(_json_load(p).get("status") == "dispatched"

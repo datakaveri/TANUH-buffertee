@@ -72,38 +72,11 @@ def set_dispatch_callback(callback) -> None:
     global _DISPATCH_CALLBACK
     _DISPATCH_CALLBACK = callback
 
-# Re-queue dispatched jobs that have timed out
-
-def _handle_dispatch_timeouts() -> None:
-    now = time.time()
-    for metadata_path in _all_job_metadata_paths():
-        try:
-            job = _json_load(metadata_path)
-        except Exception:
-            continue
-
-        if job.get("status") != "dispatched":
-            continue
-
-        # Fall back to updated_at_unix for jobs dispatched before this field existed
-        dispatched_at = job.get("dispatched_at_unix") or job.get("updated_at_unix", 0)
-        age = now - dispatched_at
-        if age < DISPATCH_TIMEOUT_SECONDS:
-            continue
-
-        job_id = job["job_id"]
-        logging.warning(
-            "[scheduler] Job %s stuck in dispatched for %.0fs (threshold %ds) — re-queuing",
-            job_id, age, DISPATCH_TIMEOUT_SECONDS,
-        )
-        job["status"] = "queued"
-        job["updated_at_unix"] = int(now)
-        job["requeue_count"] = job.get("requeue_count", 0) + 1
-        job.pop("assigned_processing_tee_id", None)
-        job.pop("processing_tee_results_url", None)
-        job.pop("dispatched_at_unix", None)
-        _json_dump(metadata_path, job)
-        _requeue_job_id(job_id)
+# NOTE: dispatched-job recovery lives in the buffer manager's
+# _finalize_dispatched_jobs() (fire-and-forget: a dispatched job whose
+# Processing TEE has self-deallocated is marked complete, not re-queued).
+# The old timeout-based re-queue here caused the same job to run repeatedly
+# because results are delivered to the leaderboard, never back to the buffer.
 
 # Delete job directories past the retention window
 
@@ -168,7 +141,6 @@ def _scheduler_loop() -> None:
     while True:
         try:
             with job_file_lock:
-                _handle_dispatch_timeouts()
                 _cleanup_old_jobs()
                 _check_queue_health()
         except Exception:
