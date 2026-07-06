@@ -606,6 +606,14 @@ def _provision_processing_tee(job):
         if _wait_for_vm(PROCESSING_RATLS_HEALTHCHECK_URL,
                         PROCESSING_VM_BOOT_TIMEOUT_SECONDS, "Processing TEE (GPU)"):
             return PROCESSING_RATLS_ADDR, PROCESSING_EXPECTED_IMAGE_DIGEST
+        # Not healthy within PROCESSING_VM_BOOT_TIMEOUT_SECONDS → stop the GPU VM
+        # so a failed / half-booted H100 is not left running (and billing) while
+        # we retry or fall back to CPU.
+        buffer_debug(
+            f"Job {job['job_id']}: GPU not healthy within "
+            f"{PROCESSING_VM_BOOT_TIMEOUT_SECONDS}s — stopping the GPU VM"
+        )
+        _stop_vm(GPU_VM_STOP_SCRIPT, "Processing TEE (GPU)")
 
     # GPU exhausted this cycle → fall back to CPU.
     buffer_debug(
