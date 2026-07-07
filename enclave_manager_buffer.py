@@ -739,11 +739,12 @@ def _finalize_dispatched_jobs():
     longer running is DONE — not orphaned. Marking it "complete" drains the
     queue and prevents the scheduler from re-dispatching (and re-running) it.
 
-    TEMPORARY stop-gap (fire-and-forget): the buffer cannot distinguish a clean
-    finish from a mid-eval crash this way. The proper fix is a completion
-    callback from the Processing TEE to buffer_job_url (already forwarded in the
-    dispatch payload) carrying the real terminal status, which would let us
-    requeue only genuine failures. See _run_ratls_dispatch / _build_secure_dispatch_payload.
+    FALLBACK path: the Processing TEE now POSTs its terminal status to
+    /buffer/jobs/<id>/complete (see complete_job), which is the ground truth
+    and marks the job before this finalizer ever sees it. This
+    dealloc-inferred path only fires for TEEs that died before calling back —
+    such jobs are still marked "complete" without a real status
+    (completion_source=dispatch_finalized distinguishes them).
 
     A dispatched job is finalized when BOTH:
       - the dispatch happened at least DISPATCH_ORPHAN_GRACE_SECONDS ago, and
@@ -985,6 +986,55 @@ def get_job_results(job_id):
 
     job = _json_load(job_path)
     return jsonify({"status": job.get("status", "unknown"), "message": "results not yet available"}), 404
+
+
+@app.route("/buffer/jobs/<job_id>/complete", methods=["POST"])
+def complete_job(job_id):
+    """Completion callback from the Processing TEE (terminal job status).
+
+    The Processing TEE POSTs {job_id, status: "succeeded"|"failed", error?}
+    here at the end of its pipeline — the buffer forwards this URL in the
+    dispatch payload as buffer_job_url; the TEE appends "/complete". This is
+    the ground-truth terminal status: a failed eval is recorded as "error"
+    instead of being silently finalized as complete.
+    _finalize_dispatched_jobs remains the fallback for a TEE that died
+    before it could call back.
+    """
+    content = request.json or {}
+    status = content.get("status", "")
+    if status not in ("succeeded", "failed"):
+        return jsonify({"status": "error",
+                        "message": "status must be 'succeeded' or 'failed'"}), 400
+    job_path = _job_metadata_path(job_id)
+    if not job_path.exists():
+        return jsonify({"status": "error", "message": "Unknown job_id"}), 404
+
+    now = int(time.time())
+    with job_file_lock:
+        job = _json_load(job_path)
+        if job.get("status") != "dispatched":
+            return jsonify({
+                "status": "ignored",
+                "message": f"job is '{job.get('status')}', not dispatched",
+            }), 409
+        job["status"]            = "complete" if status == "succeeded" else "error"
+        job["updated_at_unix"]   = now
+        job["completed_at_unix"] = now
+        job["completion_source"] = "processing_tee_callback"
+        if content.get("error"):
+            job["completion_error"] = content["error"]
+        _save_job(job)
+        _remove_job_from_queue(job_id)
+
+    buffer_debug(f"Job {job_id} terminal status via Processing TEE callback: {status}")
+    _update_dispatch_state(
+        last_dispatch_attempt_unix=now,
+        last_dispatch_job_id=job_id,
+        last_dispatch_status=f"callback_{status}",
+        last_dispatch_error="" if status == "succeeded" else json.dumps(content.get("error", {})),
+    )
+    return jsonify({"status": "success", "job_id": job_id,
+                    "job_status": job["status"]}), 200
 
 
 @app.route("/buffer/dispatch/state", methods=["GET"])

@@ -82,7 +82,7 @@ def set_dispatch_callback(callback) -> None:
 
 def _cleanup_old_jobs() -> None:
     now = time.time()
-    terminal_statuses = {"complete", "rejected"}
+    terminal_statuses = {"complete", "rejected", "error"}
     for metadata_path in _all_job_metadata_paths():
         try:
             job = _json_load(metadata_path)
