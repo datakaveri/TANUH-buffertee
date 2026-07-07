@@ -10,7 +10,7 @@ export TEE_USE_TLS="${TEE_USE_TLS:-0}"
 
 # RATLS_AUDIENCE is used by the buffer-tee Go CLIENT to verify the Processing TEE
 # (aud=ratls-buffer-tee in the Processing TEE's OIDC token). Do NOT change it.
-# The Tanuh buffer-server uses RATLS_SERVER_AUDIENCE (default: ratls-browser) separately.
+# The buffer-tee serve mode uses RATLS_SERVER_AUDIENCE (default: ratls-browser) separately.
 export TLS_CERT="${TLS_CERT:-/app/certs/tls.crt}"
 export TLS_KEY="${TLS_KEY:-/app/certs/tls.key}"
 
@@ -47,11 +47,11 @@ chmod 600 /run/certs/tls.key
 export TLS_CERT=/run/certs/tls.crt
 export TLS_KEY=/run/certs/tls.key
 
-# Start the user-facing RA-TLS HTTPS server on :8443.
+# Start the user-facing RA-TLS HTTPS server on :8443 (buffer-tee serve mode).
 # It uses RATLS_SERVER_AUDIENCE (browser-facing audience) — kept separate from
-# RATLS_AUDIENCE which is used by the buffer-tee dispatch client.
+# RATLS_AUDIENCE which is used by `buffer-tee dispatch` (Processing TEE audience).
 RATLS_AUDIENCE="${RATLS_SERVER_AUDIENCE:-ratls-browser}" \
-  /usr/local/bin/buffer-server &
+  /usr/local/bin/buffer-tee &
 RATLS_SERVER_PID=$!
 
 cleanup() {

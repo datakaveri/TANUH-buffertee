@@ -1,19 +1,13 @@
-FROM golang:1.22-bullseye AS ratls-client-builder
+# Single Go binary: `buffer-tee` serves the browser-facing RA-TLS HTTPS
+# endpoint (:8443); `buffer-tee dispatch` is the one-shot RA-TLS dispatch
+# client the job manager invokes per job.
+FROM golang:1.26-bookworm AS go-builder
 WORKDIR /src
-COPY b2p-ratls/go.mod b2p-ratls/go.sum ./b2p-ratls/
-WORKDIR /src/b2p-ratls
-RUN go mod download
-COPY b2p-ratls/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/buffer-tee ./cmd/buffer-tee/
-
-FROM golang:1.26-bookworm AS ratls-server-builder
-WORKDIR /src
-COPY Tanuh-buffer-tee-ratls/enclave/go.mod ./
-RUN echo "" > go.sum
+COPY Tanuh-buffer-tee-ratls/enclave/go.mod Tanuh-buffer-tee-ratls/enclave/go.sum ./
 RUN go mod download
 COPY Tanuh-buffer-tee-ratls/enclave/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
-    -o /out/buffer-server ./cmd/buffer-tee/
+    -o /out/buffer-tee ./cmd/buffer-tee/
 
 FROM python:3.11-slim
 
@@ -49,10 +43,9 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install -r /tmp/requirements.txt
 
 COPY . /app
-COPY --from=ratls-client-builder /out/buffer-tee /usr/local/bin/buffer-tee
-COPY --from=ratls-server-builder /out/buffer-server /usr/local/bin/buffer-server
+COPY --from=go-builder /out/buffer-tee /usr/local/bin/buffer-tee
 
-RUN chmod +x /app/entrypoint.sh /usr/local/bin/buffer-tee /usr/local/bin/buffer-server \
+RUN chmod +x /app/entrypoint.sh /usr/local/bin/buffer-tee \
     && mkdir -p /app/cvm_workflow/buffer /app/cvm_workflow/tls /app/cvm_workflow/logs
 
 LABEL "tee.launch_policy.allow_env_override"="RATLS_SERVER_AUDIENCE,TLS_CERT,TLS_KEY,GPU_CS_ADDR,GPU_CS_IMAGE_DIGEST,KEYCLOAK_JWKS_URL,KEYCLOAK_ISSUER,CPU_CS_ADDR,CPU_CS_IMAGE_DIGEST,CPU_CS_INSTANCE,CPU_CS_ZONE,MAX_GPU_PROVISION_ATTEMPTS,PROCESSING_VM_BOOT_TIMEOUT_SECONDS"

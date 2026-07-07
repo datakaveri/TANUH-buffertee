@@ -1,3 +1,9 @@
+// buffer-tee is the single Buffer TEE binary with two modes:
+//
+//	buffer-tee            run the browser-facing RA-TLS HTTPS server on :8443
+//	buffer-tee dispatch   one-shot: dispatch a secure job payload to a
+//	                      Processing TEE over RA-TLS (invoked by the job
+//	                      manager; config via env, see internal/dispatch)
 package main
 
 import (
@@ -12,11 +18,30 @@ import (
 	"time"
 
 	"github.com/datakaveri/tanuh-buffer-tee/internal/bundle"
+	"github.com/datakaveri/tanuh-buffer-tee/internal/dispatch"
 	"github.com/datakaveri/tanuh-buffer-tee/internal/rotation"
 	"github.com/datakaveri/tanuh-buffer-tee/internal/server"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "dispatch" {
+		runDispatch()
+		return
+	}
+	runServe()
+}
+
+// runDispatch performs a one-shot RA-TLS job dispatch to a Processing TEE.
+// Exit code is the contract with the Python job manager: 0 = delivered.
+func runDispatch() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if err := dispatch.Run(ctx); err != nil {
+		log.Fatalf("buffer-tee: %v", err)
+	}
+}
+
+func runServe() {
 	audience := mustEnv("RATLS_AUDIENCE")
 	certFile  := mustEnv("TLS_CERT")
 	keyFile   := mustEnv("TLS_KEY")

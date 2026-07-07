@@ -19,6 +19,7 @@ Flask enclave manager  :4100  (enclave_manager_buffer.py)
   ▼
 Scheduler (background thread, every 15 s)
   │  GPU attempt first → CPU fallback (cpu-cs-tdx) if GPU unavailable
+  │  dispatch: `buffer-tee dispatch` (one-shot RA-TLS client, same binary)
   ▼
 Processing TEE  :443  (RA-TLS dispatch)
 ```
@@ -27,11 +28,11 @@ Processing TEE  :443  (RA-TLS dispatch)
 
 | Path | Role |
 |---|---|
-| `Tanuh-buffer-tee-ratls/` | Go HTTP server — RA-TLS attestation, HPKE/AES-GCM crypto, Keycloak JWT middleware |
-| `enclave_manager_buffer.py` | Python Flask — job lifecycle, file storage, queue, scheduler, RA-TLS dispatch |
+| `Tanuh-buffer-tee-ratls/` | Single Go binary `buffer-tee` — serve mode: RA-TLS attestation server, HPKE/AES-GCM crypto, Keycloak JWT middleware; `dispatch` mode: one-shot RA-TLS dispatch client (`internal/dispatch/`) |
+| `enclave_manager_buffer.py` | Python Flask — job lifecycle, file storage, queue, scheduler, dispatch orchestration |
 | `start-gpu-cs-vm.sh` / `stop-gpu-cs-vm.sh` | GCP VM start/stop scripts for the GPU Processing TEE |
 | `start-cpu-cs-vm.sh` / `stop-cpu-cs-vm.sh` | GCP VM start/stop scripts for the CPU Processing TEE |
-| `entrypoint.sh` | Container entrypoint — starts Flask then Go proxy |
+| `entrypoint.sh` | Container entrypoint — starts the Go server (:8443), then Flask (:4100) |
 
 ## API Endpoints (Go proxy at :8443)
 
@@ -55,8 +56,8 @@ Internal Flask endpoints (`:4100`, not exposed externally): `POST /buffer/jobs`,
 2. Browser uploads model, weights, and optionally a preprocessing script via AES-256-GCM chunked PUTs
 3. Once all required files arrive and SHA-256 hashes verify → `status: queued`, appended to `queue.json`
 4. Scheduler picks next queued job → attempts GPU TEE → falls back to CPU TEE if unavailable
-5. Encrypted payload dispatched to Processing TEE over RA-TLS → `status: dispatched`
-6. Processing TEE POSTs results back → `status: complete`
+5. Encrypted payload dispatched to Processing TEE over RA-TLS (`buffer-tee dispatch`, which verifies the target's attested image digest) → `status: dispatched`
+6. Processing TEE runs the eval, submits results to the external leaderboard, and self-deallocates; the scheduler then finalizes the job → `status: complete`
 
 ## Authentication
 

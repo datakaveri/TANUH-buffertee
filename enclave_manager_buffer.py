@@ -3,15 +3,15 @@ Buffer TEE — Enclave Manager
 ============================
 
 Flow:
-  1. User-Facing UI establishes RA-TLS to the Tanuh buffer-server (Go, port 8443).
+  1. User-Facing UI establishes RA-TLS to the buffer-tee Go server (port 8443).
   2. User uploads model.onnx + weights, encrypted via HPKE inside the browser.
-  3. buffer-server decrypts inside the SEV-SNP TEE, then POSTs to /buffer/jobs here.
+  3. The Go server decrypts inside the TEE, then POSTs to /buffer/jobs here.
   4. job_scheduler.py dispatches the job to the Processing TEE via RA-TLS
-     (buffer-tee Go client → gpu-cs Go server on port 443).
-  5. Processing TEE decrypts dataset, runs ONNX inference, exposes results over
-     its RA-TLS results endpoint, then self-deallocates.
-  6. job_scheduler.py polls the Processing TEE for results and writes them to
-     local disk; GET /v1/results/{job_id} serves them to the browser.
+     (`buffer-tee dispatch` → gpu-cs Go server on port 443).
+  5. Processing TEE decrypts dataset, runs ONNX inference, submits results to
+     the external leaderboard, then self-deallocates.
+  6. The scheduler finalizes the dispatched job once its Processing TEE has
+     self-deallocated (see _finalize_dispatched_jobs for the stop-gap caveat).
 """
 
 import base64
@@ -112,7 +112,7 @@ DISPATCH_ORPHAN_GRACE_SECONDS       = int(os.getenv("DISPATCH_ORPHAN_GRACE_SECON
 
 BUFFER_RATLS_CLIENT_BIN    = os.getenv("BUFFER_RATLS_CLIENT_BIN", "")
 BUFFER_RATLS_CLIENT_WORKDIR = Path(os.getenv("BUFFER_RATLS_CLIENT_WORKDIR",
-                                              str(Path(config.base_dir) / "b2p-ratls")))
+                                              str(Path(config.base_dir) / "Tanuh-buffer-tee-ratls" / "enclave")))
 
 import subprocess, sys
 
@@ -672,12 +672,13 @@ def _write_secure_dispatch_payload(job):
 
 
 def _ratls_client_command():
+    """Dispatch runs via the single buffer-tee binary in `dispatch` mode."""
     if BUFFER_RATLS_CLIENT_BIN.strip():
-        return [BUFFER_RATLS_CLIENT_BIN.strip()], None
-    linux  = BUFFER_RATLS_CLIENT_WORKDIR / "buffer-tee"
+        return [BUFFER_RATLS_CLIENT_BIN.strip(), "dispatch"], None
+    linux = BUFFER_RATLS_CLIENT_WORKDIR / "buffer-tee"
     if linux.exists():
-        return [str(linux)], None
-    return ["go", "run", "./cmd/buffer-tee"], str(BUFFER_RATLS_CLIENT_WORKDIR)
+        return [str(linux), "dispatch"], None
+    return ["go", "run", "./cmd/buffer-tee", "dispatch"], str(BUFFER_RATLS_CLIENT_WORKDIR)
 
 
 def _run_ratls_dispatch(job, payload_path, addr=None, image_digest=None):
@@ -1003,7 +1004,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("Buffer TEE Manager — starting")
     print(f"  Flask (internal):   http://0.0.0.0:{BUFFER_TEE_PORT}")
-    print(f"  RA-TLS server:      https://0.0.0.0:8443  (buffer-server)")
+    print(f"  RA-TLS server:      https://0.0.0.0:8443  (buffer-tee)")
     print(f"  Processing TEE:     {PROCESSING_RATLS_ADDR}")
     print("=" * 60)
 
