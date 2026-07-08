@@ -108,21 +108,24 @@ func (e *OpError) Error() string {
 // Operation until DONE. Returns *OpError when the operation itself reports
 // an error.
 func StartInstance(ctx context.Context, project, zone, instance string) error {
-	return instanceAction(ctx, project, zone, instance, "start")
+	return instanceAction(ctx, project, zone, instance, "start", "")
 }
 
 // StopInstance stops an instance and polls the Operation until DONE.
+// discardLocalSsd=true is mandatory for VMs with a Local SSD attached (the
+// H100 GPU VM) — the API rejects an unqualified stop with 400 — and is
+// accepted harmlessly on VMs without one.
 func StopInstance(ctx context.Context, project, zone, instance string) error {
-	return instanceAction(ctx, project, zone, instance, "stop")
+	return instanceAction(ctx, project, zone, instance, "stop", "?discardLocalSsd=true")
 }
 
-func instanceAction(ctx context.Context, project, zone, instance, action string) error {
+func instanceAction(ctx context.Context, project, zone, instance, action, query string) error {
 	token, err := AccessToken(ctx)
 	if err != nil {
 		return err
 	}
-	u := fmt.Sprintf("https://compute.googleapis.com/compute/v1/projects/%s/zones/%s/instances/%s/%s",
-		project, zone, instance, action)
+	u := fmt.Sprintf("https://compute.googleapis.com/compute/v1/projects/%s/zones/%s/instances/%s/%s%s",
+		project, zone, instance, action, query)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader("{}"))
 	if err != nil {
