@@ -10,9 +10,16 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
@@ -45,7 +52,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	tlsCert, err := loadServingCert(ctx, cfg)
+	tlsCert, err := loadServingCert(cfg)
 	if err != nil {
 		log.Fatalf("buffer-tee: load TLS serving cert: %v", err)
 	}
@@ -117,25 +124,56 @@ func main() {
 	log.Println("buffer-tee: stopped")
 }
 
-// loadServingCert prefers explicit TLS_CERT/TLS_KEY files (local dev) and
-// otherwise fetches the cert pair from Secret Manager into memory — the
-// former entrypoint.sh curl+python bootstrap, without touching disk.
-func loadServingCert(ctx context.Context, cfg config.Config) (tls.Certificate, error) {
+// loadServingCert returns the cert for the browser-facing :8443 listener.
+//
+// The buffer runs behind a TLS-terminating reverse proxy (nginx/LB) that
+// presents the real, browser-trusted cert for the public domain and connects
+// to this listener as an upstream WITHOUT verifying its cert
+// (proxy_ssl_verify off). This cert is therefore transport-only for the proxy
+// hop — it is NOT the attestation anchor: the browser trusts the enclave via
+// the Google-signed Confidential Space token + HPKE key returned by
+// /v1/attest, which is cert-independent. So a self-signed cert generated at
+// boot is sufficient, and it removes the Secret Manager / Let's Encrypt /
+// 90-day-renewal dependency entirely.
+//
+// Escape hatch: if TLS_CERT and TLS_KEY files are both provided and present
+// (e.g. a deployment fronting the buffer with L4/TCP passthrough, where the
+// browser would validate this cert directly), those are used instead.
+func loadServingCert(cfg config.Config) (tls.Certificate, error) {
 	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
 		if _, err := os.Stat(cfg.TLSCertFile); err == nil {
 			log.Printf("buffer-tee: loading TLS cert from files (%s)", cfg.TLSCertFile)
 			return tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
 		}
 	}
-	log.Printf("buffer-tee: fetching TLS cert from Secret Manager (%s/%s)", cfg.TLSCertSecret, cfg.TLSKeySecret)
-	certPEM, err := gcp.AccessSecret(ctx, cfg.TLSProject, cfg.TLSCertSecret)
+	log.Println("buffer-tee: generating self-signed serving cert (behind TLS-terminating proxy)")
+	return selfSignedCert()
+}
+
+// selfSignedCert mints a long-lived self-signed P-256 cert in memory. Long
+// validity is safe because the fronting proxy does not verify it; its
+// security comes from the network path + the (cert-independent) attestation.
+func selfSignedCert() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	keyPEM, err := gcp.AccessSecret(ctx, cfg.TLSProject, cfg.TLSKeySecret)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{Organization: []string{"TANUH-Buffer-TEE"}},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 

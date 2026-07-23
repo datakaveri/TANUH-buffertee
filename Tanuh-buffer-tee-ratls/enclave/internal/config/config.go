@@ -41,13 +41,14 @@ type Config struct {
 	KeycloakJWKSURL string
 	KeycloakIssuer  string
 
-	// TLS serving cert: fetched from Secret Manager (secret names) or read
-	// from files (local dev fallback).
-	TLSProject    string
-	TLSCertSecret string
-	TLSKeySecret  string
-	TLSCertFile   string
-	TLSKeyFile    string
+	// TLS serving cert for the :8443 listener. The buffer runs behind a
+	// TLS-terminating reverse proxy (nginx/LB) that holds the real
+	// browser-trusted cert and does not verify this upstream cert, so the
+	// buffer self-signs at boot (see cmd/buffer-tee). These optional file
+	// paths are an escape hatch for deployments that need a provided cert
+	// here (e.g. L4/TCP passthrough); unset → self-signed.
+	TLSCertFile string
+	TLSKeyFile  string
 
 	// Dispatch client (buffer → Processing TEE).
 	DispatchAudience string // aud the Processing TEE's RA-TLS token must carry
@@ -85,11 +86,8 @@ func FromEnv() Config {
 		KeycloakJWKSURL: os.Getenv("KEYCLOAK_JWKS_URL"),
 		KeycloakIssuer:  os.Getenv("KEYCLOAK_ISSUER"),
 
-		TLSProject:    getEnv("TLS_SECRET_PROJECT", "p3dx-depa-sandbox"),
-		TLSCertSecret: getEnv("TLS_CERT_SECRET", "tanuh-tls-cert"),
-		TLSKeySecret:  getEnv("TLS_KEY_SECRET", "tanuh-tls-key"),
-		TLSCertFile:   os.Getenv("TLS_CERT"),
-		TLSKeyFile:    os.Getenv("TLS_KEY"),
+		TLSCertFile: os.Getenv("TLS_CERT"),
+		TLSKeyFile:  os.Getenv("TLS_KEY"),
 
 		DispatchAudience: getEnv("RATLS_AUDIENCE", "ratls-buffer-tee"),
 
