@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	cryptosha256 "crypto/sha256"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/datakaveri/tanuh-buffer-tee/internal/bundle"
 	hpkepkg "github.com/datakaveri/tanuh-buffer-tee/internal/hpke"
+	"github.com/datakaveri/tanuh-buffer-tee/internal/jobs"
 )
 
 const (
@@ -121,7 +121,7 @@ func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	rawKeycloakToken := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	keycloakSub := extractKeycloakSub(rawKeycloakToken)
-	response := processJob(plaintext, keycloakSub, rawKeycloakToken)
+	response := s.processJob(plaintext, keycloakSub, rawKeycloakToken)
 
 	rid := r.Header.Get("X-Request-Id")
 	respAAD := []byte(fmt.Sprintf(`{"rid":%q,"ts":%d}`, rid, time.Now().Unix()))
@@ -141,41 +141,49 @@ func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleUploadModel serves PUT /v1/upload/{job_id}/model.
-// Decrypts AES-256-GCM-CHUNKED-v1 stream, verifies SHA-256, forwards plaintext to Flask.
+// Decrypts AES-256-GCM-CHUNKED-v1 stream, verifies SHA-256, stores the artifact.
 func (s *Server) HandleUploadModel(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("job_id")
-	plaintext, err := s.decryptChunkedUpload(r.Body, r.Header.Get("X-RATLS-Browser-HPKE"))
-	if err != nil {
-		log.Printf("model upload decrypt %s: %v", jobID, err)
-		http.Error(w, "decryption failed: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	proxyPlaintextUpload(w, bufferManagerURL+"/buffer/jobs/"+jobID+"/model", plaintext)
+	s.handleUpload(w, r, jobs.ModelFileName)
 }
 
 // HandleUploadWeights serves PUT /v1/upload/{job_id}/weights.
 func (s *Server) HandleUploadWeights(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("job_id")
-	plaintext, err := s.decryptChunkedUpload(r.Body, r.Header.Get("X-RATLS-Browser-HPKE"))
-	if err != nil {
-		log.Printf("weights upload decrypt %s: %v", jobID, err)
-		http.Error(w, "decryption failed: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	proxyPlaintextUpload(w, bufferManagerURL+"/buffer/jobs/"+jobID+"/weights", plaintext)
+	s.handleUpload(w, r, jobs.WeightsFileName)
 }
 
 // HandleUploadPreprocessing serves PUT /v1/upload/{job_id}/preprocessing.
-// Decrypts the user's preprocessing.py and forwards plaintext to Flask.
 func (s *Server) HandleUploadPreprocessing(w http.ResponseWriter, r *http.Request) {
+	s.handleUpload(w, r, jobs.PreprocessingFileName)
+}
+
+// handleUpload decrypts a chunked upload and hands the plaintext to the job
+// store, which re-verifies the submit-time SHA-256 commitment and queues the
+// job once all required artifacts are present.
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, artifact string) {
 	jobID := r.PathValue("job_id")
 	plaintext, err := s.decryptChunkedUpload(r.Body, r.Header.Get("X-RATLS-Browser-HPKE"))
 	if err != nil {
-		log.Printf("preprocessing upload decrypt %s: %v", jobID, err)
+		log.Printf("%s upload decrypt %s: %v", artifact, jobID, err)
 		http.Error(w, "decryption failed: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	proxyPlaintextUpload(w, bufferManagerURL+"/buffer/jobs/"+jobID+"/preprocessing", plaintext)
+	job, err := s.store.ReceiveArtifact(jobID, artifact, plaintext)
+	if err != nil {
+		code := http.StatusBadRequest
+		if strings.Contains(err.Error(), "unknown job_id") {
+			code = http.StatusNotFound
+		}
+		writeJSON(w, code, map[string]any{"status": "error", "message": err.Error()})
+		return
+	}
+	if job.Status == jobs.StatusQueued {
+		log.Printf("job %s all required files received — queued", jobID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": job.Status,
+		"job_id": jobID,
+		"bytes":  len(plaintext),
+	})
 }
 
 // decryptChunkedUpload reads and decrypts an AES-256-GCM-CHUNKED-v1 framed stream.
@@ -306,61 +314,32 @@ func (s *Server) decryptChunkedUpload(body io.Reader, browserPubB64u string) ([]
 	return assembled, nil
 }
 
-// proxyPlaintextUpload PUTs decrypted plaintext bytes to Flask.
-func proxyPlaintextUpload(w http.ResponseWriter, url string, data []byte) {
-	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(data))
-	if err != nil {
-		http.Error(w, "proxy error", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = int64(len(data))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("upload proxy %s: %v", url, err)
-		http.Error(w, "buffer manager unavailable", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body) //nolint:errcheck
-}
-
-func processJob(plaintext []byte, keycloakSub string, keycloakToken string) []byte {
+// processJob creates the job record in the in-process store. The response
+// JSON shape is unchanged from the Flask era: {status, job_id, dataset_id}.
+func (s *Server) processJob(plaintext []byte, keycloakSub string, keycloakToken string) []byte {
 	var jobReq JobRequest
 	if err := json.Unmarshal(plaintext, &jobReq); err != nil {
 		return jsonErr("invalid job payload: " + err.Error())
 	}
-	if jobReq.DatasetID < 1 || jobReq.DatasetID > 3 {
-		return jsonErr("dataset_id must be 1, 2, or 3")
-	}
 
-	flaskData := map[string]interface{}{
-		"dataset_id":      jobReq.DatasetID,
-		"model_sha256":    jobReq.ModelSHA256,
-		"weights_sha256":  jobReq.WeightsSHA256,
-		"submitted_by":    keycloakSub,
-		"keycloak_token":  keycloakToken,
-	}
-	if jobReq.PreprocessingSHA256 != "" {
-		flaskData["preprocessing_sha256"] = jobReq.PreprocessingSHA256
-	}
-	flaskPayload, _ := json.Marshal(flaskData)
-
-	resp, err := http.Post(bufferManagerURL+"/buffer/jobs", "application/json", //nolint:noctx
-		bytes.NewReader(flaskPayload))
+	job, err := s.store.Create(jobs.NewJobRequest{
+		DatasetID:        jobReq.DatasetID,
+		ModelSHA256:      jobReq.ModelSHA256,
+		WeightsSHA256:    jobReq.WeightsSHA256,
+		PreprocessingSHA: jobReq.PreprocessingSHA256,
+		SubmittedBy:      keycloakSub,
+		KeycloakToken:    keycloakToken,
+	})
 	if err != nil {
-		log.Printf("submit: buffer-manager: %v", err)
-		return jsonErr("buffer manager unavailable: " + err.Error())
+		return jsonErr(err.Error())
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	log.Printf("submit: buffer-manager %d", resp.StatusCode)
-	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
-		return jsonErr(fmt.Sprintf("buffer manager error %d: %s", resp.StatusCode, string(respBody)))
-	}
+	log.Printf("submit: job %s created (dataset %d)", job.JobID, job.DatasetID)
+
+	respBody, _ := json.Marshal(map[string]any{
+		"status":     job.Status, // "pending_upload"
+		"job_id":     job.JobID,
+		"dataset_id": job.DatasetID,
+	})
 	return respBody
 }
 

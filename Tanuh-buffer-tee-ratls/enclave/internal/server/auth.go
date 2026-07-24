@@ -239,11 +239,21 @@ func requireRole(role string, next http.Handler) http.Handler {
 	})
 }
 
+// isCompletionCallback matches POST /v1/jobs/{id}/complete — the Processing
+// TEE's machine-to-machine callback, which authenticates with a CS
+// attestation token instead of a Keycloak user JWT (see HandleComplete).
+func isCompletionCallback(r *http.Request) bool {
+	return r.Method == http.MethodPost &&
+		strings.HasPrefix(r.URL.Path, "/v1/jobs/") &&
+		strings.HasSuffix(r.URL.Path, "/complete")
+}
+
 // keycloakAuthMiddleware enforces Keycloak JWT auth on all routes except
-// OPTIONS (CORS preflight) and /healthz.
+// OPTIONS (CORS preflight), /healthz, and the completion callback (which
+// carries its own attestation-based auth).
 func keycloakAuthMiddleware(jwksURL, issuer string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodOptions || r.URL.Path == "/healthz" {
+		if r.Method == http.MethodOptions || r.URL.Path == "/healthz" || isCompletionCallback(r) {
 			next.ServeHTTP(w, r)
 			return
 		}

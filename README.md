@@ -1,116 +1,87 @@
 # TANUH Buffer TEE
 
-Always-on AMD SEV Confidential Space VM that sits between the browser and the Processing TEE. It handles attestation, encrypted job intake, file staging, queueing, and secure dispatch — the browser never communicates with the Processing TEE directly.
+Always-on Confidential Space VM that sits between the browser and the Processing TEE. It handles attestation, encrypted job intake, file staging, queueing, provisioning, and secure dispatch — the browser never communicates with the Processing TEE directly.
+
+The runtime is a **single static Go binary** (`buffer-tee`) in a distroless image. There is no Python, no shell, no sidecar processes.
 
 ## Architecture
 
 ```
 Browser
-  │  HPKE-encrypted metadata  (POST /v1/submit)
-  │  AES-256-GCM chunked file  (PUT  /v1/upload/:job_id/model|weights|preprocessing)
+  │  HPKE-encrypted metadata   (POST /v1/submit)
+  │  AES-256-GCM chunked files (PUT  /v1/upload/:job_id/model|weights|preprocessing)
   ▼
-Go RA-TLS proxy  :8443  (Tanuh-buffer-tee-ratls/)
-  │  Keycloak JWT validated here
-  │  HPKE decrypt / AES-GCM decrypt / SHA-256 verify
-  ▼
-Flask enclave manager  :4100  (enclave_manager_buffer.py)
-  │  Job records + file staging under /app/cvm_workflow/buffer/
-  │  Ordered queue in queue.json
-  ▼
-Scheduler (background thread, every 15 s)
-  │  GPU attempt first → CPU fallback (cpu-cs-tdx) if GPU unavailable
-  ▼
-Processing TEE  :443  (RA-TLS dispatch)
+buffer-tee (Go, :8443, TLS 1.3, Keycloak JWT)
+  ├─ HPKE / AES-GCM decrypt + SHA-256 verification
+  ├─ job store + ordered queue   (cvm_workflow/buffer/, JSON on disk)
+  ├─ scheduler (every 15 s): retention cleanup, stall warnings,
+  │    bounded crash recovery, dispatch cycle
+  ├─ provisioning: GPU-first (capped stop→start attempts, Compute API with
+  │    Operation polling → quota errors fail over fast) → CPU fallback
+  ├─ RA-TLS dispatch (in-process): verify Processing TEE attestation
+  │    (image digest, hwmodel, EKM channel binding) → POST /api/load-model
+  └─ completion callback receiver  (POST /v1/jobs/:id/complete,
+       authenticated by the Processing TEE's CS attestation token)
 ```
 
-## Components
+## Job lifecycle
 
-| Path | Role |
-|---|---|
-| `Tanuh-buffer-tee-ratls/` | Go HTTP server — RA-TLS attestation, HPKE/AES-GCM crypto, Keycloak JWT middleware |
-| `enclave_manager_buffer.py` | Python Flask — job lifecycle, file storage, queue, scheduler, RA-TLS dispatch |
-| `start-gpu-cs-vm.sh` / `stop-gpu-cs-vm.sh` | GCP VM start/stop scripts for the GPU Processing TEE |
-| `start-cpu-cs-vm.sh` / `stop-cpu-cs-vm.sh` | GCP VM start/stop scripts for the CPU Processing TEE |
-| `entrypoint.sh` | Container entrypoint — starts Flask then Go proxy |
+1. Browser POSTs HPKE-encrypted `{dataset_id, model_sha256, weights_sha256[, preprocessing_sha256]}` → job `pending_upload`
+2. Encrypted chunked uploads; each artifact's SHA-256 must match the submit-time commitment → `queued`
+3. Scheduler provisions a Processing TEE (GPU attempts → CPU fallback) and dispatches over RA-TLS → `dispatched`
+4. Processing TEE runs the eval, submits results to the leaderboard, then POSTs its terminal status here → `complete` or `error` (with the classified failure)
+5. If the TEE dies without calling back: after `DISPATCH_TIMEOUT_SECONDS` with the TEE unhealthy the job is requeued, at most `MAX_REQUEUE` times, then marked `error` — nothing can loop forever.
 
-## API Endpoints (Go proxy at :8443)
+## API (:8443)
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/v1/attest` | — | RA-TLS attestation bundle (OIDC token + HPKE pub + liveness sig) |
-| `POST` | `/v1/submit` | JWT | HPKE-encrypted job metadata → returns `{ job_id }` |
-| `PUT` | `/v1/upload/:job_id/model` | JWT | AES-256-GCM chunked model upload |
-| `PUT` | `/v1/upload/:job_id/weights` | JWT | AES-256-GCM chunked weights upload |
-| `PUT` | `/v1/upload/:job_id/preprocessing` | JWT | AES-256-GCM chunked preprocessing script upload |
-| `GET` | `/v1/status/:job_id` | JWT | Job status record |
-| `GET` | `/v1/queue` | JWT (`org_admin`) | All jobs + ordered queue; includes `queued_count` |
-| `GET` | `/v1/results/:job_id` | JWT | Job results once complete |
+| `GET` | `/v1/attest` | Keycloak JWT | RA-TLS attestation bundle (OIDC token + HPKE pub + liveness sig) |
+| `POST` | `/v1/submit` | Keycloak JWT | HPKE-encrypted job metadata → `{job_id}` |
+| `PUT` | `/v1/upload/:job_id/model\|weights\|preprocessing` | Keycloak JWT | AES-256-GCM chunked upload |
+| `GET` | `/v1/status/:job_id` | Keycloak JWT | Job record |
+| `GET` | `/v1/queue` | Keycloak JWT + `org_admin` | All jobs + queue |
+| `GET` | `/v1/results/:job_id` | Keycloak JWT | Job status (results live on the leaderboard) |
+| `POST` | `/v1/jobs/:job_id/complete` | **CS attestation token** | Terminal status from the Processing TEE. Token must verify against Google's CS JWKS, carry `image_digest` ∈ {GPU, CPU expected digests}, and its `eat_nonce` must equal `hex(sha256(body))` — bound to the exact payload. |
 | `GET` | `/healthz` | — | Health check |
 
-Internal Flask endpoints (`:4100`, not exposed externally): `POST /buffer/jobs`, `GET /buffer/jobs`, `GET /buffer/jobs/:id`, `PUT /buffer/jobs/:id/model|weights|preprocessing`, `GET /buffer/jobs/:id/results`, `GET /buffer/dispatch/state`, `GET /healthz`
+## Environment variables
 
-## Job Lifecycle
-
-1. Browser POSTs HPKE-encrypted `{ dataset_id, model_sha256, weights_sha256 }` → job record created (`status: pending`)
-2. Browser uploads model, weights, and optionally a preprocessing script via AES-256-GCM chunked PUTs
-3. Once all required files arrive and SHA-256 hashes verify → `status: queued`, appended to `queue.json`
-4. Scheduler picks next queued job → attempts GPU TEE → falls back to CPU TEE if unavailable
-5. Encrypted payload dispatched to Processing TEE over RA-TLS → `status: dispatched`
-6. Processing TEE POSTs results back → `status: complete`
-
-## Authentication
-
-All routes except `/v1/attest` and `/healthz` require a Keycloak Bearer JWT. The Go proxy validates the RS256 signature against the JWKS endpoint on every request.
-
-`GET /v1/queue` additionally requires the `org_admin` realm role (`realm_access.roles`).
-
-## Environment Variables
-
-All runtime vars must be passed via GCP Confidential Space metadata with the `tee-env-` prefix.
+Passed via Confidential Space metadata (`tee-env-` prefix). The image bakes only safe defaults; digests must always come from metadata.
 
 | Variable | Default | Description |
 |---|---|---|
-| `RATLS_SERVER_AUDIENCE` | `ratls-browser` | Expected audience in OIDC token presented by browser |
-| `GPU_CS_ADDR` | `10.128.15.210:443` | Internal IP:port of the GPU Processing TEE |
-| `GPU_CS_IMAGE_DIGEST` | *(see Dockerfile)* | Expected image digest for GPU TEE RA-TLS verification |
-| `CPU_CS_ADDR` | — | Internal IP:port of the CPU Processing TEE |
-| `CPU_CS_IMAGE_DIGEST` | — | Expected image digest for CPU TEE RA-TLS verification |
-| `CPU_CS_INSTANCE` | — | GCP instance name of the CPU Processing TEE |
-| `CPU_CS_ZONE` | — | GCP zone of the CPU Processing TEE |
-| `MAX_GPU_PROVISION_ATTEMPTS` | `1` | GPU provision attempts before falling back to CPU |
-| `PROCESSING_VM_BOOT_TIMEOUT_SECONDS` | `300` | Seconds to wait for Processing TEE to boot |
-| `SCHEDULER_INTERVAL_SECONDS` | `15` | Queue poll interval in seconds |
-| `KEYCLOAK_JWKS_URL` | — | JWKS endpoint for JWT validation |
-| `KEYCLOAK_ISSUER` | — | Expected `iss` claim in Keycloak JWTs |
+| `GPU_CS_ADDR` / `CPU_CS_ADDR` | — | Processing TEE RA-TLS `ip:port` |
+| `GPU_CS_IMAGE_DIGEST` / `CPU_CS_IMAGE_DIGEST` | — (required) | Expected attested image digests (dispatch pins them) |
+| `GPU_CS_INSTANCE`/`GPU_CS_ZONE`, `CPU_CS_INSTANCE`/`CPU_CS_ZONE` | gpu-cs-tdx-h100 / cpu-cs-tdx, us-central1-a | Compute start/stop targets |
+| `MAX_GPU_PROVISION_ATTEMPTS` | 1 | GPU stop→start attempts per job before CPU fallback |
+| `PROCESSING_VM_BOOT_TIMEOUT_SECONDS` / `CPU_VM_BOOT_TIMEOUT_SECONDS` | 300 | Boot-health wait per attempt |
+| `DISPATCH_TIMEOUT_SECONDS` | 600 | No-callback threshold before crash recovery |
+| `MAX_REQUEUE` | 2 | Requeue budget per job, then `error` |
+| `BUFFER_CALLBACK_BASE` | https://tee.dev.tanuh.iudx.io:8443 | Base URL the Processing TEE calls back to |
+| `CALLBACK_AUDIENCE` | tanuh-buffer-callback | Required `aud` in the callback attestation token |
+| `KEYCLOAK_JWKS_URL` / `KEYCLOAK_ISSUER` | — | Browser JWT validation (empty disables auth) |
+| `TLS_CERT` / `TLS_KEY` | — | Local-dev cert files; unset → fetched from Secret Manager (`tanuh-tls-cert`/`tanuh-tls-key`) in memory |
 
-## Build & Deploy
+## Build & deploy
 
 ```bash
 IMAGE=us-central1-docker.pkg.dev/p3dx-depa-sandbox/ratls/buffer-tee
+docker build -t $IMAGE:<tag> . && docker push $IMAGE:<tag>
+docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:<tag>
 
-docker build -t $IMAGE:latest .
-docker push $IMAGE:latest
-
-# Get digest — required for tee-image-reference metadata and UI constants.ts
-docker inspect --format='{{index .RepoDigests 0}}' $IMAGE:latest
-```
-
-Update VM metadata:
-```bash
-gcloud compute instances add-metadata buffer-tee-vm --zone=us-east1-c \
+gcloud compute instances add-metadata buffer-tee-vm-tdx --zone=us-east1-c \
   --metadata tee-image-reference=$IMAGE@sha256:<digest>
 ```
 
-Update `constants.ts` in `Tanuh-browser-ratls/src/lib/constants.ts` with the new digest, then rebuild the UI.
+Every buffer redeploy changes the digest the browser pins — update `EXPECTED_IMAGE_DIGEST` in `Tanuh-browser-ratls` `constants.ts` and rebuild the UI.
 
 ## Debug
 
-Serial/container logs include:
-- `[Buffer-TEE]` — Go proxy lifecycle events
-- `[Buffer-TEE workflow]` — Flask job and scheduler events
-- `[scheduler]` — Scheduler ticks and dispatch decisions
-
-Runtime state is persisted at `/app/cvm_workflow/buffer/` inside the container:
+All state persists under `/app/cvm_workflow/buffer/` (same layout as the former Python manager — a rollback reads the same files):
 - `jobs/<job_id>/job.json` — job record
-- `queue.json` — ordered queue of pending job IDs
-- `outgoing/<job_id>-secure-dispatch.json` — encrypted dispatch payload
+- `queue.json` — ordered queue
+- `outgoing/<job_id>-secure-dispatch.json` — staged dispatch payload
+- `runtime/dispatch_state.json` — last dispatch breadcrumbs
+
+Serial log prefixes: `buffer-tee:` (server), `scheduler:`, `provision:`, `dispatch:`, `server:`.

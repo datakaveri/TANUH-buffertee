@@ -1,62 +1,36 @@
-FROM golang:1.22-bullseye AS ratls-client-builder
+# TANUH Buffer TEE — single static Go binary, distroless image.
+#
+# buffer-tee owns everything in-process: browser-facing RA-TLS HTTPS server
+# (:8443, HPKE submit + AES-GCM chunked uploads), the persistent job store,
+# the GPU-first/CPU-fallback provisioning state machine (Compute API with
+# Operation polling), RA-TLS dispatch to the Processing TEE, the
+# attestation-authenticated completion callback, and bounded crash recovery.
+# The TLS serving cert is fetched from Secret Manager at startup (in-memory).
+FROM golang:1.26-bookworm AS go-builder
 WORKDIR /src
-COPY b2p-ratls/go.mod b2p-ratls/go.sum ./b2p-ratls/
-WORKDIR /src/b2p-ratls
-RUN go mod download
-COPY b2p-ratls/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/buffer-tee ./cmd/buffer-tee/
-
-FROM golang:1.26-bookworm AS ratls-server-builder
-WORKDIR /src
-COPY Tanuh-buffer-tee-ratls/enclave/go.mod ./
-RUN echo "" > go.sum
+COPY Tanuh-buffer-tee-ratls/enclave/go.mod Tanuh-buffer-tee-ratls/enclave/go.sum ./
 RUN go mod download
 COPY Tanuh-buffer-tee-ratls/enclave/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
-    -o /out/buffer-server ./cmd/buffer-tee/
+    -o /out/buffer-tee ./cmd/buffer-tee/
 
-FROM python:3.11-slim
+# distroless/static: CA certificates included (needed for Google APIs +
+# Keycloak JWKS), no shell, no libc — the attested image is the binary.
+FROM gcr.io/distroless/static-debian12
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app \
-    BASE_DIR=/app \
-    DEBIAN_FRONTEND=noninteractive \
-    TEE_USE_TLS=0 \
-    BUFFER_RATLS_CLIENT_BIN=/usr/local/bin/buffer-tee \
-    GPU_CS_ADDR=10.128.15.210:443 \
-    GPU_CS_IMAGE_DIGEST=sha256:3fadd63f22df132aa794e2da23e64a6981acdad40f74dcb82b13d753e8598577 \
-    RATLS_AUDIENCE=ratls-buffer-tee \
-    BUFFER_BOOTSTRAP_PLACEHOLDER_QUEUE=0 \
-    SCHEDULER_INTERVAL_SECONDS=15 \
+ENV BASE_DIR=/app \
     RATLS_SERVER_AUDIENCE=ratls-browser \
-    TLS_CERT=/run/certs/tls.crt \
-    TLS_KEY=/run/certs/tls.key
+    RATLS_AUDIENCE=ratls-buffer-tee \
+    GPU_CS_ADDR=10.128.0.37:443 \
+    CPU_CS_INSTANCE=cpu-cs-tdx \
+    MAX_GPU_PROVISION_ATTEMPTS=1 \
+    SCHEDULER_INTERVAL_SECONDS=15
 
-WORKDIR /app
+COPY --from=go-builder /out/buffer-tee /buffer-tee
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        ca-certificates \
-        curl \
-        libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+LABEL "tee.launch_policy.allow_env_override"="RATLS_SERVER_AUDIENCE,GPU_CS_ADDR,GPU_CS_IMAGE_DIGEST,GPU_CS_INSTANCE,GPU_CS_ZONE,KEYCLOAK_JWKS_URL,KEYCLOAK_ISSUER,CPU_CS_ADDR,CPU_CS_IMAGE_DIGEST,CPU_CS_INSTANCE,CPU_CS_ZONE,MAX_GPU_PROVISION_ATTEMPTS,PROCESSING_VM_BOOT_TIMEOUT_SECONDS,CPU_VM_BOOT_TIMEOUT_SECONDS,DISPATCH_TIMEOUT_SECONDS,MAX_REQUEUE,BUFFER_CALLBACK_BASE,CALLBACK_AUDIENCE,PROJECT"
+LABEL "tee.launch_policy.allow_cmd_override"="false"
 
-COPY requirements.txt /tmp/requirements.txt
-RUN python -m pip install --upgrade pip \
-    && python -m pip install -r /tmp/requirements.txt
+EXPOSE 8443
 
-COPY . /app
-COPY --from=ratls-client-builder /out/buffer-tee /usr/local/bin/buffer-tee
-COPY --from=ratls-server-builder /out/buffer-server /usr/local/bin/buffer-server
-
-RUN chmod +x /app/entrypoint.sh /usr/local/bin/buffer-tee /usr/local/bin/buffer-server \
-    && mkdir -p /app/cvm_workflow/buffer /app/cvm_workflow/tls /app/cvm_workflow/logs
-
-LABEL "tee.launch_policy.allow_env_override"="RATLS_SERVER_AUDIENCE,TLS_CERT,TLS_KEY,GPU_CS_ADDR,GPU_CS_IMAGE_DIGEST,KEYCLOAK_JWKS_URL,KEYCLOAK_ISSUER,CPU_CS_ADDR,CPU_CS_IMAGE_DIGEST,CPU_CS_INSTANCE,CPU_CS_ZONE,MAX_GPU_PROVISION_ATTEMPTS,PROCESSING_VM_BOOT_TIMEOUT_SECONDS"
-
-EXPOSE 4100 8443
-
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/buffer-tee"]
